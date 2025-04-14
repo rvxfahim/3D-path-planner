@@ -49,7 +49,7 @@ def normalize_point_cloud(points):
     normalized_points = (points - min_vals) / range_vals
     return normalized_points
 
-obstacle_points = normalize_point_cloud(obstacle_points)
+# obstacle_points = normalize_point_cloud(obstacle_points)
 point_cloud_time = time.time() - start_time
 
 # Create visualization-only downsampled point cloud
@@ -65,15 +65,17 @@ else:
 # Create empty space points for navigation
 # Generate a grid of points in the empty space (avoiding obstacles)
 start_time = time.time()
-grid_resolution = 0.05  # Adjust based on your environment size
-x = np.arange(0, 1, grid_resolution)
-y = np.arange(0, 1, grid_resolution)
-z = np.arange(0, 1, grid_resolution)
-X, Y, Z = np.meshgrid(x, y, z)
+min_vals = np.min(obstacle_points, axis=0)
+max_vals = np.max(obstacle_points, axis=0)
+grid_resolution = 0.1  # Adjust resolution for grid points
+x_vals = np.arange(min_vals[0], max_vals[0], grid_resolution)
+y_vals = np.arange(min_vals[1], max_vals[1], grid_resolution)
+z_vals = np.arange(min_vals[2], max_vals[2], grid_resolution)
+X, Y, Z = np.meshgrid(x_vals, y_vals, z_vals)
 grid_points = np.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T
 
 # Filter grid points to keep only those sufficiently far from obstacles
-min_obstacle_distance = 0.03  # Minimum clearance from obstacles
+min_obstacle_distance = .5  # Minimum clearance from obstacles
 tree_obstacles = KDTree(obstacle_points)  # Use full resolution for accurate distances
 distances, _ = tree_obstacles.query(grid_points)
 empty_space_points = grid_points[distances > min_obstacle_distance]
@@ -84,6 +86,20 @@ if len(empty_space_points) > 3000:
     empty_space_points = empty_space_points[indices]
 empty_space_creation_time = time.time() - start_time
 
+def visualize_empty_space_points():
+    fig_empty = plt.figure(figsize=(8,6))
+    ax_empty = fig_empty.add_subplot(111, projection='3d')
+    ax_empty.scatter(empty_space_points[:, 0], empty_space_points[:, 1], empty_space_points[:, 2],
+                     c='cyan', s=5, alpha=0.7)
+    ax_empty.set_xlabel("X")
+    ax_empty.set_ylabel("Y")
+    ax_empty.set_zlabel("Z")
+    ax_empty.set_title("Empty Space Points")
+    plt.show()
+
+# Call the new function to visualize empty space
+visualize_empty_space_points()
+
 # Timing: KDTree creation for empty space points
 start_time = time.time()
 tree = KDTree(empty_space_points)
@@ -92,7 +108,7 @@ kdtree_time = time.time() - start_time
 # Timing: Graph creation of navigable empty space
 start_time = time.time()
 G = nx.Graph()
-k_neighbors = 10  # Connect each point to its k nearest neighbors
+k_neighbors = 30  # Connect each point to its k nearest neighbors
 for i, p in enumerate(empty_space_points):
     neighbors = tree.query(p, k=k_neighbors+1)[1][1:]  # Skip self
     for n in neighbors:
@@ -158,12 +174,12 @@ def create_visualization():
     ax_goal_z = plt.axes([0.2, 0.00, 0.65, 0.02])
     
     # Create the sliders
-    s_start_x = Slider(ax_start_x, 'Start X', 0, 1, valinit=start_point[0])
-    s_start_y = Slider(ax_start_y, 'Start Y', 0, 1, valinit=start_point[1])
-    s_start_z = Slider(ax_start_z, 'Start Z', 0, 1, valinit=start_point[2])
-    s_goal_x = Slider(ax_goal_x, 'Goal X', 0, 1, valinit=goal_point[0])
-    s_goal_y = Slider(ax_goal_y, 'Goal Y', 0, 1, valinit=goal_point[1])
-    s_goal_z = Slider(ax_goal_z, 'Goal Z', 0, 1, valinit=goal_point[2])
+    s_start_x = Slider(ax_start_x, 'Start X', min_vals[0], max_vals[0], valinit=start_point[0])
+    s_start_y = Slider(ax_start_y, 'Start Y', min_vals[1], max_vals[1], valinit=start_point[1])
+    s_start_z = Slider(ax_start_z, 'Start Z', min_vals[2], max_vals[2], valinit=start_point[2])
+    s_goal_x = Slider(ax_goal_x, 'Goal X', min_vals[0], max_vals[0], valinit=goal_point[0])
+    s_goal_y = Slider(ax_goal_y, 'Goal Y', min_vals[1], max_vals[1], valinit=goal_point[1])
+    s_goal_z = Slider(ax_goal_z, 'Goal Z', min_vals[2], max_vals[2], valinit=goal_point[2])
     
     # Connect the update function to the sliders
     s_start_x.on_changed(update)
