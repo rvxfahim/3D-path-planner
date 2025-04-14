@@ -91,6 +91,263 @@ D_g, I_g = gpu_index_obstacles.search(grid_points_f32, 1)
 distances = np.sqrt(D_g[:, 0])
 empty_space_points = grid_points[distances > min_obstacle_distance]
 
+def improved_look_down_algorithm(obstacle_points, grid_min, grid_max, cell_size=0.1, height_intervals=3):
+    """
+    Improved 'look down' algorithm that can detect surfaces under overhangs.
+    
+    Args:
+        obstacle_points: The obstacle point cloud
+        grid_min: Minimum coordinates of the grid
+        grid_max: Maximum coordinates of the grid
+        cell_size: Size of each cubic cell (default: 0.1 = 10cm)
+        height_intervals: Number of different heights to test from (default: 3)
+    
+    Returns:
+        Array of points representing the centers of supported cells
+    """
+    print("Applying improved look down algorithm...")
+    start_time = time.time()
+    
+    # Prepare grid for cell centers
+    x_cells = np.arange(grid_min[0] + cell_size/2, grid_max[0], cell_size)
+    y_cells = np.arange(grid_min[1] + cell_size/2, grid_max[1], cell_size)
+    
+    # Calculate height intervals
+    z_range = grid_max[2] - grid_min[2]
+    z_starts = np.linspace(grid_max[2], grid_min[2] + cell_size, height_intervals)
+    
+    # Keep track of placed cells
+    placed_cells = []
+    placed_cells_dict = {}  # Dictionary to track cells by xy position
+    
+    # Prepare FAISS index for fast collision detection
+    res_placed = faiss.StandardGpuResources()
+    placed_cells_gpu_index = None
+    
+    # Process cells in XY horizontal slices
+    total_cells = len(x_cells) * len(y_cells) * height_intervals
+    cells_processed = 0
+    
+    print(f"Processing {total_cells} potential cell positions...")
+    
+    # For each starting height
+    for z_start in z_starts:
+        for x_idx, x in enumerate(x_cells):
+            for y_idx, y in enumerate(y_cells):
+                # Display progress periodically
+                cells_processed += 1
+                if cells_processed % 5000 == 0:
+                    print(f"Processing cell {cells_processed}/{total_cells} ({cells_processed/total_cells*100:.1f}%)")
+                
+                # Create a key for this xy position
+                xy_key = f"{int(x*100)}_{int(y*100)}"
+                
+                # Check if we already have cells at this xy position at different heights
+                if xy_key in placed_cells_dict:
+                    # Get the heights of previously placed cells at this position
+                    placed_heights = placed_cells_dict[xy_key]
+                    # Skip if we already have too many cells at this xy position
+                    if len(placed_heights) >= 2:  # Allow at most 2 cells in same xy position (ground level + one shelf)
+                        continue
+                
+                # Start dropping the cell from the current height level
+                z = z_start
+                cell_center = np.array([x, y, z])
+                
+                # Start dropping the cell
+                cell_placed = False
+                while z >= grid_min[2] + cell_size/2 and not cell_placed:
+                    # Define cell corners for collision check
+                    half_size = cell_size / 2
+                    cell_corners = np.array([
+                        [x-half_size, y-half_size, z-half_size],
+                        [x+half_size, y-half_size, z-half_size],
+                        [x-half_size, y+half_size, z-half_size],
+                        [x+half_size, y+half_size, z-half_size],
+                        [x-half_size, y-half_size, z+half_size],
+                        [x+half_size, y-half_size, z+half_size],
+                        [x-half_size, y+half_size, z+half_size],
+                        [x+half_size, y+half_size, z+half_size],
+                    ]).astype(np.float32)
+                    
+                    # Check if cell collides with obstacles
+                    D_corners, _ = gpu_index_obstacles.search(cell_corners, 1)
+                    min_dist = np.min(np.sqrt(D_corners))
+                    
+                    if min_dist < cell_size/2:  # Collision with obstacles
+                        # Move up a bit to avoid intersection
+                        z += cell_size/2
+                        
+                        # Check for clearance above to ensure robot can stand here
+                        clearance_check = np.array([[x, y, z + 0.5]]).astype(np.float32)  # Check 0.5m above for robot height
+                        D_clearance, _ = gpu_index_obstacles.search(clearance_check, 1)
+                        if np.sqrt(D_clearance[0, 0]) > 0.5:  # Ensure enough vertical clearance for robot
+                            cell_center = np.array([x, y, z])
+                            
+                            # Check if we already have a cell at this xy position
+                            if xy_key in placed_cells_dict:
+                                # If there's already a cell at this position, only add if at a different height
+                                existing_heights = placed_cells_dict[xy_key]
+                                # Make sure the new cell is not too close to existing ones
+                                too_close = False
+                                for existing_z in existing_heights:
+                                    if abs(existing_z - z) < cell_size*2:
+                                        too_close = True
+                                        break
+                                
+                                if not too_close:
+                                    placed_cells.append(cell_center)
+                                    placed_cells_dict.setdefault(xy_key, []).append(z)
+                                    if placed_cells_gpu_index is not None:
+                                        placed_cells_gpu_index.add(np.array([cell_center]).astype(np.float32))
+                            else:
+                                placed_cells.append(cell_center)
+                                placed_cells_dict[xy_key] = [z]
+                                # Initialize GPU index for placed cells if needed
+                                if len(placed_cells) % 1000 == 1:
+                                    if placed_cells_gpu_index is None and len(placed_cells) > 1:
+                                        placed_cells_array = np.array(placed_cells).astype(np.float32)
+                                        placed_cells_gpu_index = faiss.IndexFlatL2(3)
+                                        placed_cells_gpu_index = faiss.index_cpu_to_gpu(res_placed, 0, placed_cells_gpu_index)
+                                        placed_cells_gpu_index.add(placed_cells_array)
+                                    elif placed_cells_gpu_index is not None:
+                                        placed_cells_gpu_index.add(np.array([cell_center]).astype(np.float32))
+                        
+                        cell_placed = True
+                    else:
+                        # Drop the cell further down
+                        z -= cell_size/4  # Use smaller steps for more precision
+                
+                # If we reached the bottom with no collision, place at ground level
+                if not cell_placed:
+                    if xy_key not in placed_cells_dict:  # Only place if we don't already have a cell here
+                        cell_center = np.array([x, y, grid_min[2] + cell_size/2])
+                        placed_cells.append(cell_center)
+                        placed_cells_dict[xy_key] = [grid_min[2] + cell_size/2]
+                        if placed_cells_gpu_index is not None:
+                            placed_cells_gpu_index.add(np.array([cell_center]).astype(np.float32))
+    
+    # Convert to numpy array
+    supported_cells = np.array(placed_cells) if placed_cells else np.empty((0, 3))
+    
+    # Log timing information
+    elapsed_time = time.time() - start_time
+    print(f"Improved look down algorithm completed in {elapsed_time:.2f} seconds")
+    print(f"Generated {len(supported_cells)} supported cells")
+    
+    # Add connectivity information
+    print("Analyzing connectivity between cells...")
+    
+    # Create a graph of connected cells to identify isolated cells
+    if len(supported_cells) > 0:
+        connect_supported_cells(supported_cells, cell_size)
+    
+    return supported_cells
+
+def connect_supported_cells(supported_cells, cell_size):
+    """
+    Build a connectivity graph between supported cells and identify isolated regions
+    """
+    # Create FAISS index for supported cells
+    supported_cells_f32 = supported_cells.astype(np.float32)
+    res_support = faiss.StandardGpuResources()
+    support_index = faiss.IndexFlatL2(3)
+    gpu_support_index = faiss.index_cpu_to_gpu(res_support, 0, support_index)
+    gpu_support_index.add(supported_cells_f32)
+    
+    # Find connections between nearby cells
+    G = nx.Graph()
+    
+    # Add all cells as nodes
+    for i in range(len(supported_cells)):
+        G.add_node(i)
+    
+    # Connect nearby cells (within 1.5 * cell_size)
+    connection_threshold = cell_size * 1.5
+    
+    # Batch processing for large cell arrays
+    batch_size = 1000
+    for i in range(0, len(supported_cells), batch_size):
+        batch_end = min(i + batch_size, len(supported_cells))
+        batch = supported_cells_f32[i:batch_end]
+        
+        # Search for nearby cells
+        D, I = gpu_support_index.search(batch, 10)  # Find 10 nearest neighbors
+        
+        # Process results
+        for j in range(len(batch)):
+            cell_idx = i + j
+            for k in range(10):
+                neighbor_idx = I[j, k]
+                if neighbor_idx != cell_idx and neighbor_idx < len(supported_cells):
+                    dist = np.sqrt(D[j, k])
+                    if dist <= connection_threshold:
+                        # Cells are close enough to be connected
+                        G.add_edge(cell_idx, neighbor_idx, weight=dist)
+    
+    # Find connected components
+    components = list(nx.connected_components(G))
+    print(f"Found {len(components)} connected regions")
+    
+    # Identify the largest component
+    largest_component = max(components, key=len)
+    print(f"Largest connected region has {len(largest_component)} cells")
+    
+    # Count isolated cells (not in the largest component)
+    isolated_cells = sum(len(c) for c in components if c != largest_component)
+    print(f"Found {isolated_cells} isolated cells in {len(components)-1} smaller regions")
+    
+    return G
+
+# Apply the improved algorithm
+cell_size = 0.5  # 20cm cells (can adjust based on your robot size)
+supported_cells = improved_look_down_algorithm(obstacle_points, min_vals, max_vals, cell_size, height_intervals=5)
+
+# Visualize the supported cells
+def visualize_supported_cells_3d():
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Plot obstacles (downsampled)
+    max_vis_obstacles = min(5000, len(obstacle_points))
+    if len(obstacle_points) > max_vis_obstacles:
+        indices = np.random.choice(len(obstacle_points), max_vis_obstacles, replace=False)
+        vis_obstacles = obstacle_points[indices]
+    else:
+        vis_obstacles = obstacle_points
+        
+    ax.scatter(vis_obstacles[:, 0], vis_obstacles[:, 1], vis_obstacles[:, 2], 
+              c='gray', alpha=0.2, s=1, label='Obstacles')
+    
+    # Plot supported cells
+    if len(supported_cells) > 0:
+        # Color by height
+        norm_heights = (supported_cells[:, 2] - min_vals[2]) / (max_vals[2] - min_vals[2])
+        sc = ax.scatter(supported_cells[:, 0], supported_cells[:, 1], supported_cells[:, 2],
+                  c=norm_heights, cmap='viridis', alpha=0.8, s=30, label='Supported Cells')
+        plt.colorbar(sc, ax=ax, label='Height')
+    
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title('Supported Cells from Improved Look Down Algorithm')
+    ax.legend()
+    
+    # Set equal aspect ratio
+    max_range = np.array([max_vals[0]-min_vals[0], max_vals[1]-min_vals[1], max_vals[2]-min_vals[2]]).max() / 2.0
+    mid_x = (max_vals[0]+min_vals[0]) * 0.5
+    mid_y = (max_vals[1]+min_vals[1]) * 0.5
+    mid_z = (max_vals[2]+min_vals[2]) * 0.5
+    ax.set_xlim(mid_x - max_range, mid_x + max_range)
+    ax.set_ylim(mid_y - max_range, mid_y + max_range)
+    ax.set_zlim(mid_z - max_range, mid_z + max_range)
+    
+    plt.tight_layout()
+    plt.show()
+
+# Visualize the results
+visualize_supported_cells_3d()
+
 # Downsample if needed (too many points will make graph creation slow)
 # if len(empty_space_points) > 3000:
 #     indices = np.random.choice(len(empty_space_points), 3000, replace=False)
