@@ -1,3 +1,4 @@
+import faiss
 import numpy as np
 import networkx as nx
 from scipy.spatial import KDTree
@@ -39,6 +40,11 @@ def load_point_cloud(file_path):
 pcd_file_path = "Scene.pcd"  # Change this to your file path
 obstacle_points = load_point_cloud(pcd_file_path)
 
+res_obstacles = faiss.StandardGpuResources()
+index_flat_obs = faiss.IndexFlatL2(3)
+gpu_index_obstacles = faiss.index_cpu_to_gpu(res_obstacles, 0, index_flat_obs)
+gpu_index_obstacles.add(obstacle_points.astype(np.float32))
+
 # Normalize point cloud to [0,1] range if needed
 def normalize_point_cloud(points):
     min_vals = np.min(points, axis=0)
@@ -67,7 +73,7 @@ else:
 start_time = time.time()
 min_vals = np.min(obstacle_points, axis=0)
 max_vals = np.max(obstacle_points, axis=0)
-grid_resolution = 0.1  # Adjust resolution for grid points
+grid_resolution = 0.5  # Adjust resolution for grid points
 x_vals = np.arange(min_vals[0], max_vals[0], grid_resolution)
 y_vals = np.arange(min_vals[1], max_vals[1], grid_resolution)
 z_vals = np.arange(min_vals[2], max_vals[2], grid_resolution)
@@ -75,15 +81,20 @@ X, Y, Z = np.meshgrid(x_vals, y_vals, z_vals)
 grid_points = np.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T
 
 # Filter grid points to keep only those sufficiently far from obstacles
-min_obstacle_distance = .5  # Minimum clearance from obstacles
-tree_obstacles = KDTree(obstacle_points)  # Use full resolution for accurate distances
-distances, _ = tree_obstacles.query(grid_points)
+min_obstacle_distance = .2  # Minimum clearance from obstacles
+# tree_obstacles = KDTree(obstacle_points)  # Use full resolution for accurate distances
+# distances, _ = tree_obstacles.query(grid_points)
+# empty_space_points = grid_points[distances > min_obstacle_distance]
+
+grid_points_f32 = grid_points.astype(np.float32)
+D_g, I_g = gpu_index_obstacles.search(grid_points_f32, 1)
+distances = np.sqrt(D_g[:, 0])
 empty_space_points = grid_points[distances > min_obstacle_distance]
 
 # Downsample if needed (too many points will make graph creation slow)
-if len(empty_space_points) > 3000:
-    indices = np.random.choice(len(empty_space_points), 3000, replace=False)
-    empty_space_points = empty_space_points[indices]
+# if len(empty_space_points) > 3000:
+#     indices = np.random.choice(len(empty_space_points), 3000, replace=False)
+#     empty_space_points = empty_space_points[indices]
 empty_space_creation_time = time.time() - start_time
 
 def visualize_empty_space_points():
@@ -102,26 +113,47 @@ visualize_empty_space_points()
 
 # Timing: KDTree creation for empty space points
 start_time = time.time()
-tree = KDTree(empty_space_points)
+# tree = KDTree(empty_space_points)
+empty_space_points_f32 = empty_space_points.astype(np.float32)
+res_empty = faiss.StandardGpuResources()
+index_flat_empty = faiss.IndexFlatL2(3)
+gpu_index_empty = faiss.index_cpu_to_gpu(res_empty, 0, index_flat_empty)
+gpu_index_empty.add(empty_space_points_f32)
 kdtree_time = time.time() - start_time
 
 # Timing: Graph creation of navigable empty space
 start_time = time.time()
 G = nx.Graph()
-k_neighbors = 30  # Connect each point to its k nearest neighbors
-for i, p in enumerate(empty_space_points):
-    neighbors = tree.query(p, k=k_neighbors+1)[1][1:]  # Skip self
-    for n in neighbors:
-        # Check if line between points intersects obstacles
-        line_points = 10  # Number of check points along the line
-        t = np.linspace(0, 1, line_points).reshape(-1, 1)
-        check_points = p.reshape(1, 3) * (1-t) + empty_space_points[n].reshape(1, 3) * t
+# k_neighbors = 30  # Connect each point to its k nearest neighbors
+# for i, p in enumerate(empty_space_points):
+#     neighbors = tree.query(p, k=k_neighbors+1)[1][1:]  # Skip self
+#     for n in neighbors:
+#         # Check if line between points intersects obstacles
+#         line_points = 10  # Number of check points along the line
+#         t = np.linspace(0, 1, line_points).reshape(-1, 1)
+#         check_points = p.reshape(1, 3) * (1-t) + empty_space_points[n].reshape(1, 3) * t
         
-        # Query distances to nearest obstacles
-        check_distances, _ = tree_obstacles.query(check_points)
-        if np.all(check_distances > min_obstacle_distance):
-            # Path is clear, add edge
-            G.add_edge(i, n, weight=np.linalg.norm(empty_space_points[i] - empty_space_points[n]))
+#         # Query distances to nearest obstacles
+#         check_distances, _ = tree_obstacles.query(check_points)
+#         if np.all(check_distances > min_obstacle_distance):
+#             # Path is clear, add edge
+#             G.add_edge(i, n, weight=np.linalg.norm(empty_space_points[i] - empty_space_points[n]))
+k_neighbors = 30
+D_es, I_es = gpu_index_empty.search(empty_space_points_f32, k_neighbors + 1)
+for i in range(len(empty_space_points)):
+    p = empty_space_points[i]
+    neighbors = I_es[i, 1:]  # skip self
+    for n in neighbors:
+        # Check small line segments for obstacle clearance
+        line_points = 10
+        t = np.linspace(0, 1, line_points).reshape(-1, 1)
+        check_points = p.reshape(1, 3)*(1-t) + empty_space_points[n].reshape(1, 3)*t
+        check_points_f32 = check_points.astype(np.float32)
+
+        D_chk, I_chk = gpu_index_obstacles.search(check_points_f32, 1)
+        if np.all(np.sqrt(D_chk[:, 0]) > min_obstacle_distance):
+            G.add_edge(i, n, weight=np.linalg.norm(p - empty_space_points[n]))
+
 graph_creation_time = time.time() - start_time
 
 # Initialize start and goal
@@ -129,8 +161,10 @@ start_point = np.array([0.1, 0.2, 0.3])
 goal_point = np.array([0.8, 0.8, 0.8])
 
 # Find nearest empty space points
-start_idx = tree.query(start_point)[1]
-goal_idx = tree.query(goal_point)[1]
+# start_idx = tree.query(start_point)[1]
+# goal_idx = tree.query(goal_point)[1]
+start_idx = gpu_index_empty.search(start_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
+goal_idx = gpu_index_empty.search(goal_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
 
 # Path calculation
 path_calculation_time = 0
@@ -251,8 +285,11 @@ def update(_):
     goal_point = np.array([s_goal_x.val, s_goal_y.val, s_goal_z.val])
     
     # Find nearest navigable points
-    start_idx = tree.query(start_point)[1]
-    goal_idx = tree.query(goal_point)[1]
+    # start_idx = tree.query(start_point)[1]
+    # goal_idx = tree.query(goal_point)[1]
+
+    start_idx = gpu_index_empty.search(start_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
+    goal_idx = gpu_index_empty.search(goal_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
     
     # Recompute path
     path_found = find_path()
