@@ -147,7 +147,7 @@ def improved_look_down_algorithm(obstacle_points, grid_min, grid_max, cell_size=
                     # Get the heights of previously placed cells at this position
                     placed_heights = placed_cells_dict[xy_key]
                     # Skip if we already have too many cells at this xy position
-                    if len(placed_heights) >= 2:  # Allow at most 2 cells in same xy position (ground level + one shelf)
+                    if len(placed_heights) >= 5:  # Allow at most 2 cells in same xy position (ground level + one shelf)
                         continue
                 
                 # Start dropping the cell from the current height level
@@ -300,7 +300,7 @@ def connect_supported_cells(supported_cells, cell_size):
     return G
 
 # Apply the improved algorithm
-cell_size = 0.5  # 20cm cells (can adjust based on your robot size)
+cell_size = 0.5  # (can adjust based on your robot size)
 supported_cells = improved_look_down_algorithm(obstacle_points, min_vals, max_vals, cell_size, height_intervals=5)
 
 # Visualize the supported cells
@@ -354,6 +354,8 @@ visualize_supported_cells_3d()
 #     empty_space_points = empty_space_points[indices]
 empty_space_creation_time = time.time() - start_time
 
+empty_space_points = np.array(supported_cells)  # Use the supported cells as empty space points
+
 def visualize_empty_space_points():
     fig_empty = plt.figure(figsize=(8,6))
     ax_empty = fig_empty.add_subplot(111, projection='3d')
@@ -395,12 +397,25 @@ G = nx.Graph()
 #         if np.all(check_distances > min_obstacle_distance):
 #             # Path is clear, add edge
 #             G.add_edge(i, n, weight=np.linalg.norm(empty_space_points[i] - empty_space_points[n]))
+start_time = time.time()
+G = nx.Graph()
 k_neighbors = 30
 D_es, I_es = gpu_index_empty.search(empty_space_points_f32, k_neighbors + 1)
 for i in range(len(empty_space_points)):
     p = empty_space_points[i]
     neighbors = I_es[i, 1:]  # skip self
     for n in neighbors:
+        # Only connect points at similar heights (prevent flying)
+        height_diff = abs(p[2] - empty_space_points[n][2])
+        if height_diff > cell_size * 0.5:  # Allow only small vertical changes
+            continue  # Skip this connection
+            
+        # Check horizontal distance (optional additional constraint)
+        horizontal_dist = np.sqrt((p[0] - empty_space_points[n][0])**2 + 
+                                 (p[1] - empty_space_points[n][1])**2)
+        if horizontal_dist > cell_size * 2.0:  # Too far horizontally
+            continue
+            
         # Check small line segments for obstacle clearance
         line_points = 10
         t = np.linspace(0, 1, line_points).reshape(-1, 1)
