@@ -91,6 +91,48 @@ D_g, I_g = gpu_index_obstacles.search(grid_points_f32, 1)
 distances = np.sqrt(D_g[:, 0])
 empty_space_points = grid_points[distances > min_obstacle_distance]
 
+def is_potential_edge(x, y, z, cell_size, gpu_index_obstacles):
+    """Check if a cell might be at an edge by sampling its neighborhood"""
+    # Sample points around the cell at different distances
+    check_points = []
+    for radius in [cell_size*0.8, cell_size*1.2, cell_size*1.6]:
+        for angle in np.linspace(0, 2*np.pi, 8, endpoint=False):
+            dx = radius * np.cos(angle)
+            dy = radius * np.sin(angle)
+            check_points.append([x + dx, y + dy, z - cell_size/2])
+    
+    check_points = np.array(check_points).astype(np.float32)
+    D_check, _ = gpu_index_obstacles.search(check_points, 1)
+    distances = np.sqrt(D_check[:, 0])
+    
+    # If some points have support and others don't, it might be an edge
+    has_support = distances < 0.2
+    if np.any(has_support) and np.any(~has_support):
+        return True
+    return False
+
+def check_cell_support(x, y, z, cell_size, gpu_index_obstacles):
+    """Check if a cell has sufficient support underneath it"""
+    # Generate a grid of points on the bottom face of the cell
+    support_check_points = []
+    check_resolution = cell_size / 4  # Check 5x5 grid on bottom face
+    
+    for dx in np.linspace(-cell_size/2, cell_size/2, 5):
+        for dy in np.linspace(-cell_size/2, cell_size/2, 5):
+            support_check_points.append([x + dx, y + dy, z - cell_size/2 - 0.05])  # Slightly below cell
+    
+    support_check_points = np.array(support_check_points).astype(np.float32)
+    
+    # Check distances to obstacles
+    D_support, _ = gpu_index_obstacles.search(support_check_points, 1)
+    distances = np.sqrt(D_support[:, 0])
+    
+    # Calculate support ratio - percentage of points that have support
+    supported_points = np.sum(distances < 0.2)  # Points close to obstacle = supported
+    support_ratio = supported_points / len(support_check_points)
+    
+    return support_ratio > 0.6  # Require at least 60% support
+
 def improved_look_down_algorithm(obstacle_points, grid_min, grid_max, cell_size=0.1, height_intervals=3):
     """
     Improved 'look down' algorithm that can detect surfaces under overhangs.
@@ -156,10 +198,15 @@ def improved_look_down_algorithm(obstacle_points, grid_min, grid_max, cell_size=
                 
                 # Start dropping the cell
                 cell_placed = False
+                edge_safety_margin = cell_size / 4  # Safety margin for edge detection
                 while z >= grid_min[2] + cell_size/2 and not cell_placed:
                     # Define cell corners for collision check
                     half_size = cell_size / 2
-                    cell_corners = np.array([
+                    safety_check_size = half_size + edge_safety_margin  # Safety margin for edge detection
+                    
+                    # Use additional points around the cell perimeter to check for edges
+                    cell_check_points = np.array([
+                        # Original corners
                         [x-half_size, y-half_size, z-half_size],
                         [x+half_size, y-half_size, z-half_size],
                         [x-half_size, y+half_size, z-half_size],
@@ -168,20 +215,36 @@ def improved_look_down_algorithm(obstacle_points, grid_min, grid_max, cell_size=
                         [x+half_size, y-half_size, z+half_size],
                         [x-half_size, y+half_size, z+half_size],
                         [x+half_size, y+half_size, z+half_size],
+                        
+                        # Additional edge detection points with safety margin
+                        [x-safety_check_size, y, z-half_size],  # Left edge
+                        [x+safety_check_size, y, z-half_size],  # Right edge
+                        [x, y-safety_check_size, z-half_size],  # Front edge
+                        [x, y+safety_check_size, z-half_size],  # Back edge
+                        [x-safety_check_size, y-safety_check_size, z-half_size],  # Diagonals
+                        [x+safety_check_size, y-safety_check_size, z-half_size],
+                        [x-safety_check_size, y+safety_check_size, z-half_size],
+                        [x+safety_check_size, y+safety_check_size, z-half_size],
                     ]).astype(np.float32)
                     
-                    # Check if cell collides with obstacles
-                    D_corners, _ = gpu_index_obstacles.search(cell_corners, 1)
-                    min_dist = np.min(np.sqrt(D_corners))
+                    # Check if any of these points are too close to obstacles
+                    D_check, _ = gpu_index_obstacles.search(cell_check_points, 1)
+                    min_dist = np.min(np.sqrt(D_check))
                     
                     if min_dist < cell_size/2:  # Collision with obstacles
                         # Move up a bit to avoid intersection
                         z += cell_size/2
-                        
-                        # Check for clearance above to ensure robot can stand here
-                        clearance_check = np.array([[x, y, z + 0.5]]).astype(np.float32)  # Check 0.5m above for robot height
+                        if is_potential_edge(x, y, z, cell_size, gpu_index_obstacles):
+                            # This might be an edge cell, do stricter checking
+                            if not check_cell_support(x, y, z, cell_size/2, gpu_index_obstacles):  # Use smaller cell size for edge check
+                                # Skip this cell - it's likely on an edge
+                                continue
+                        # Check for clearance above for robot height
+                        clearance_check = np.array([[x, y, z + 0.5]]).astype(np.float32)
                         D_clearance, _ = gpu_index_obstacles.search(clearance_check, 1)
-                        if np.sqrt(D_clearance[0, 0]) > 0.5:  # Ensure enough vertical clearance for robot
+
+                        # Add support check to prevent edge cells without sufficient support
+                        if np.sqrt(D_clearance[0, 0]) > 0.5 and check_cell_support(x, y, z, cell_size, gpu_index_obstacles):
                             cell_center = np.array([x, y, z])
                             
                             # Check if we already have a cell at this xy position
@@ -302,6 +365,24 @@ def connect_supported_cells(supported_cells, cell_size):
 # Apply the improved algorithm
 cell_size = 0.5  # (can adjust based on your robot size)
 supported_cells = improved_look_down_algorithm(obstacle_points, min_vals, max_vals, cell_size, height_intervals=5)
+
+def filter_unsafe_cells(cells, gpu_index_obstacles, cell_size):
+    """Remove cells that appear to be on edges or have insufficient support"""
+    safe_cells = []
+    
+    for cell in cells:
+        x, y, z = cell
+        
+        # Check for minimum support underneath
+        if check_cell_support(x, y, z, cell_size, gpu_index_obstacles):
+            # Check if not too close to edge
+            if not is_potential_edge(x, y, z, cell_size, gpu_index_obstacles):
+                safe_cells.append(cell)
+    
+    return np.array(safe_cells)
+
+# Use this after generating all cells
+supported_cells = filter_unsafe_cells(supported_cells, gpu_index_obstacles, cell_size)
 
 # Visualize the supported cells
 def visualize_supported_cells_3d():
