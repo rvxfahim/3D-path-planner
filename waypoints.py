@@ -99,25 +99,44 @@ def cpu_raycasting_fallback(obstacle_points, grid_min, grid_max, cell_size):
     return np.empty((0, 3))
 
 def check_clearance_faiss_gpu(potential_hits, obstacle_points_f32, min_clearance, cell_size, gpu_index_obstacles):
-    """Checks clearance above potential hit points using FAISS GPU index with kNN search."""
+    """
+    Checks clearance above potential hit points using FAISS GPU index with k=1 NN search.
+    Ensures no obstacle point is within min_clearance distance vertically above the hit point.
+    """
     if len(potential_hits) == 0:
         return np.array([], dtype=bool)
 
-    # Define clearance check points above the hit surface
+    # Define clearance check points slightly ABOVE the required clearance zone
+    # If this point is clear, the space below it down to the hit point should be clear.
     check_points = potential_hits.copy()
-    check_points[:, 2] += min_clearance / 2.0
+    # Check at the very top of the required clearance volume
+    check_points[:, 2] += min_clearance
     check_points_f32 = check_points.astype(np.float32)
-    
-    # Search radius squared (used for filtering distances)
-    threshold_sq = ((min_clearance / 2.0) + (cell_size / 2.0))**2
-    
-    # Use k-nearest neighbor search instead of range search
-    k = 10  # Check several closest points to ensure we don't miss anything
+
+    # Find the single nearest neighbor to the check point
+    k = 1
+    # D contains SQUARE distances
     D, I = gpu_index_obstacles.search(check_points_f32, k)
-    
-    # For each query point, check if any of the k nearest neighbors are too close
-    clearance_ok = np.all(D > threshold_sq, axis=1)
-    
+
+    # The clearance is okay if the distance to the NEAREST obstacle point
+    # from the check_point (at height z + min_clearance) is greater than min_clearance.
+    # This implies the sphere of radius min_clearance centered at the check point is empty.
+    # We compare squared distances for efficiency.
+    min_clearance_sq = min_clearance**2
+
+    # D has shape (N, 1), so we access the first column D[:, 0]
+    clearance_ok = D[:, 0] > min_clearance_sq
+
+    # Alternative stricter check (closer to original intent?):
+    # Ensure nothing is within half the clearance distance of a point halfway up the clearance zone.
+    # check_points = potential_hits.copy()
+    # check_points[:, 2] += min_clearance / 2.0
+    # check_points_f32 = check_points.astype(np.float32)
+    # k=1
+    # D, I = gpu_index_obstacles.search(check_points_f32, k)
+    # clearance_radius_sq = (min_clearance / 2.0)**2
+    # clearance_ok = D[:, 0] > clearance_radius_sq
+
     return clearance_ok
 
 
@@ -364,7 +383,7 @@ def improved_look_down_algorithm_multi_start(
     if len(supported_cells) > 0:
         print("Analyzing connectivity...")
         # Assuming connect_supported_cells uses FAISS GPU index internally
-        G = connect_supported_cells(supported_cells, cell_size, gpu_index_obstacles.res) # Pass faiss resources
+        G = connect_supported_cells(supported_cells, cell_size, faiss_res) # Pass faiss resources
     else:
         G = None # Or nx.Graph()
 
@@ -415,10 +434,10 @@ def connect_supported_cells(supported_cells, cell_size, faiss_res=None):
         batch_end = min(i + batch_size, num_cells)
         # Query points directly on GPU
         batch_query_cp = cp.asarray(supported_cells_f32[i:batch_end])
-
+        batch_query_np = batch_query_cp.get()
         # Use range search for fixed radius or knn search and filter by distance
         # Let's use knn search and filter, might be more robust than guessing radius
-        D, I = gpu_support_index.search(batch_query_cp, k_neighbors) # D is squared distances
+        D, I = gpu_support_index.search(batch_query_np, k_neighbors)
 
         # Process results (can potentially stay on GPU longer if needed)
         D_cpu = cp.asnumpy(D)
@@ -464,9 +483,49 @@ def connect_supported_cells(supported_cells, cell_size, faiss_res=None):
     return G
 
 # Apply the improved algorithm
-cell_size = 0.1  # (can adjust based on your robot size)
+cell_size = 0.25  # (can adjust based on your robot size)
 supported_cells, G = improved_look_down_algorithm_multi_start(obstacle_points=obstacle_points, 
-    grid_min=min_vals, grid_max=max_vals, cell_size=cell_size, num_z_levels=5, min_clearance=0.001)
+    grid_min=min_vals, grid_max=max_vals, cell_size=cell_size, num_z_levels=5, min_clearance=0.1)
+
+robot_width = 0.5  # Width of robot in meters
+robot_length = 0.5  # Length of robot in meters
+robot_height = 0.2  # Height of robot in meters (optional, for clearance check)
+
+def verify_waypoint_support(point, supported_cells, robot_width, robot_length):
+    """
+    Verify if a point has sufficient support for the robot's dimensions.
+    
+    Args:
+        point (np.array): The waypoint to check (x, y, z)
+        supported_cells (np.array): All available supported cells
+        robot_width (float): Width of the robot
+        robot_length (float): Length of the robot
+        
+    Returns:
+        bool: True if the point has sufficient support, False otherwise
+    """
+    # Define the robot's footprint boundary (centered at the point)
+    half_width = robot_width / 2
+    half_length = robot_length / 2
+    
+    # Find all supported cells within the robot's footprint
+    footprint_mask = (
+        (supported_cells[:, 0] >= point[0] - half_width) & 
+        (supported_cells[:, 0] <= point[0] + half_width) & 
+        (supported_cells[:, 1] >= point[1] - half_length) & 
+        (supported_cells[:, 1] <= point[1] + half_length) &
+        # Allow small height variations (e.g. 10% of cell_size)
+        (abs(supported_cells[:, 2] - point[2]) < cell_size * 0.1)  
+    )
+    
+    footprint_cells = supported_cells[footprint_mask]
+    
+    # Check if we have sufficient support (e.g., at least 60% of the footprint area is supported)
+    robot_area = robot_width * robot_length
+    supported_area = len(footprint_cells) * (cell_size ** 2)  # Approximate
+    support_ratio = supported_area / robot_area
+    
+    return support_ratio > 0.6  # Require at least 60% support (adjustable threshold)
 
 # Visualize the supported cells
 def visualize_supported_cells_3d():
@@ -572,13 +631,13 @@ for i in range(len(empty_space_points)):
     for n in neighbors:
         # Only connect points at similar heights (prevent flying)
         height_diff = abs(p[2] - empty_space_points[n][2])
-        if height_diff > cell_size * 0.5:  # Allow only small vertical changes
+        if height_diff > 0.5 * 0.5:  # Allow only small vertical changes
             continue  # Skip this connection
             
         # Check horizontal distance (optional additional constraint)
         horizontal_dist = np.sqrt((p[0] - empty_space_points[n][0])**2 + 
                                  (p[1] - empty_space_points[n][1])**2)
-        if horizontal_dist > cell_size * 2.0:  # Too far horizontally
+        if horizontal_dist > 0.5 * 2.0:  # Too far horizontally
             continue
             
         # Check small line segments for obstacle clearance
@@ -613,7 +672,53 @@ def find_path():
     path_start_time = time.time()
     try:
         # Path finding with A*
-        path = nx.astar_path(G, start_idx, goal_idx, weight='weight')
+        raw_path = nx.astar_path(G, start_idx, goal_idx, weight='weight')
+        
+        # Filter waypoints to ensure sufficient support for the robot
+        valid_waypoints = []
+        for idx in raw_path:
+            point = empty_space_points[idx]
+            if verify_waypoint_support(point, supported_cells, robot_width, robot_length):
+                valid_waypoints.append(idx)
+            else:
+                print(f"Warning: Waypoint at {point} has insufficient support")
+                
+        if len(valid_waypoints) < 2:  # Need at least start and goal
+            print("Not enough valid waypoints with sufficient support")
+            path_calculation_time = time.time() - path_start_time
+            return False
+            
+        # Attempt to find a path through only valid waypoints
+        # This requires rebuilding a subgraph of only valid nodes
+        if len(valid_waypoints) < len(raw_path):
+            print(f"Reduced path from {len(raw_path)} to {len(valid_waypoints)} supported waypoints")
+            subgraph = G.subgraph(valid_waypoints).copy()
+            
+            # Remap node indices to ensure we have a contiguous range
+            mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(valid_waypoints)}
+            subgraph = nx.relabel_nodes(subgraph, mapping)
+            
+            # Find new path through the subgraph
+            start_idx_remapped = mapping.get(start_idx)
+            goal_idx_remapped = mapping.get(goal_idx)
+            
+            if start_idx_remapped is None or goal_idx_remapped is None:
+                print("Start or goal no longer in valid waypoints")
+                path_calculation_time = time.time() - path_start_time
+                return False
+                
+            try:
+                sub_path = nx.astar_path(subgraph, start_idx_remapped, goal_idx_remapped, weight='weight')
+                # Map back to original indices
+                reverse_mapping = {new_idx: old_idx for old_idx, new_idx in mapping.items()}
+                path = [reverse_mapping[idx] for idx in sub_path]
+            except nx.NetworkXNoPath:
+                print("No path found through supported waypoints")
+                path_calculation_time = time.time() - path_start_time
+                return False
+        else:
+            path = raw_path
+            
         waypoints = empty_space_points[path]
         path_calculation_time = time.time() - path_start_time
         print(f"Found path with {len(waypoints)} waypoints in {path_calculation_time:.4f} seconds")
@@ -626,23 +731,28 @@ def find_path():
 # Create a better structured visualization setup
 def create_visualization():
     global fig, ax, colorbar, s_start_x, s_start_y, s_start_z, s_goal_x, s_goal_y, s_goal_z
+    global s_robot_width, s_robot_length
     
     # Create figure with proper size and layout
     fig = plt.figure(figsize=(12, 10))
     
     # Add adjustable sliders at the bottom of the figure
-    plt.subplots_adjust(bottom=0.35)
+    plt.subplots_adjust(bottom=0.4)  # Make more room for sliders
     
     # Create the main 3D axes for visualization
     ax = fig.add_subplot(111, projection='3d')
     
-    # Create slider axes
-    ax_start_x = plt.axes([0.2, 0.25, 0.65, 0.02])
-    ax_start_y = plt.axes([0.2, 0.20, 0.65, 0.02])
-    ax_start_z = plt.axes([0.2, 0.15, 0.65, 0.02])
-    ax_goal_x = plt.axes([0.2, 0.10, 0.65, 0.02])
-    ax_goal_y = plt.axes([0.2, 0.05, 0.65, 0.02])
-    ax_goal_z = plt.axes([0.2, 0.00, 0.65, 0.02])
+    # Create slider axes for start/goal positions
+    ax_start_x = plt.axes([0.2, 0.30, 0.65, 0.02])
+    ax_start_y = plt.axes([0.2, 0.25, 0.65, 0.02])
+    ax_start_z = plt.axes([0.2, 0.20, 0.65, 0.02])
+    ax_goal_x = plt.axes([0.2, 0.15, 0.65, 0.02])
+    ax_goal_y = plt.axes([0.2, 0.10, 0.65, 0.02])
+    ax_goal_z = plt.axes([0.2, 0.05, 0.65, 0.02])
+    
+    # Add robot size sliders
+    ax_robot_width = plt.axes([0.2, 0.35, 0.65, 0.02])
+    ax_robot_length = plt.axes([0.2, 0.40, 0.65, 0.02])
     
     # Create the sliders
     s_start_x = Slider(ax_start_x, 'Start X', min_vals[0], max_vals[0], valinit=start_point[0])
@@ -652,6 +762,10 @@ def create_visualization():
     s_goal_y = Slider(ax_goal_y, 'Goal Y', min_vals[1], max_vals[1], valinit=goal_point[1])
     s_goal_z = Slider(ax_goal_z, 'Goal Z', min_vals[2], max_vals[2], valinit=goal_point[2])
     
+    # Robot dimension sliders
+    s_robot_width = Slider(ax_robot_width, 'Robot Width', 0.1, 1.0, valinit=robot_width)
+    s_robot_length = Slider(ax_robot_length, 'Robot Length', 0.1, 1.0, valinit=robot_length)
+    
     # Connect the update function to the sliders
     s_start_x.on_changed(update)
     s_start_y.on_changed(update)
@@ -659,6 +773,8 @@ def create_visualization():
     s_goal_x.on_changed(update)
     s_goal_y.on_changed(update)
     s_goal_z.on_changed(update)
+    s_robot_width.on_changed(update)
+    s_robot_length.on_changed(update)
     
     # Initialize colorbar as None
     colorbar = None
@@ -675,7 +791,7 @@ def update_plot():
         colorbar.remove()
         colorbar = None
 
-    # Clear the axis (or selectively clear only plots without affecting the colorbar axes)
+    # Clear the axis
     ax.clear()
     
     # Now create the scatter plot and a new colorbar
@@ -687,7 +803,7 @@ def update_plot():
     colorbar = plt.colorbar(scatter, ax=ax, pad=0.1, fraction=0.046, aspect=20)
     colorbar.set_label('Height (Z)')
     
-    # Plot the start, goal, and navigation points, etc.
+    # Plot the start, goal, and navigation points
     ax.scatter(start_point[0], start_point[1], start_point[2], c='green', s=100, label='Start')
     ax.scatter(goal_point[0], goal_point[1], goal_point[2], c='blue', s=100, label='Goal')
     ax.scatter(
@@ -702,11 +818,33 @@ def update_plot():
     if path_found:
         ax.scatter(waypoints[:, 0], waypoints[:, 1], waypoints[:, 2], c='red', s=30, label='Waypoints')
         ax.plot(waypoints[:, 0], waypoints[:, 1], waypoints[:, 2], 'r-', linewidth=2)
+        
+        # Draw robot footprint at each waypoint (just a few for visibility)
+        show_footprints = min(len(waypoints), 5)  # Show at most 5 footprints
+        step = max(1, len(waypoints) // show_footprints)
+        
+        for i in range(0, len(waypoints), step):
+            wp = waypoints[i]
+            half_width = robot_width / 2
+            half_length = robot_length / 2
+            
+            # Create rectangle vertices for the robot footprint
+            rect_points = [
+                [wp[0] - half_width, wp[1] - half_length, wp[2]],
+                [wp[0] + half_width, wp[1] - half_length, wp[2]],
+                [wp[0] + half_width, wp[1] + half_length, wp[2]],
+                [wp[0] - half_width, wp[1] + half_length, wp[2]],
+                [wp[0] - half_width, wp[1] - half_length, wp[2]]  # Close the loop
+            ]
+            rect_points = np.array(rect_points)
+            
+            # Plot the footprint
+            ax.plot(rect_points[:, 0], rect_points[:, 1], rect_points[:, 2], 'orange', linewidth=1.5)
     
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
-    ax.set_title('3D Navigation Through Height-Colored Space')
+    ax.set_title('3D Navigation with Robot-Sized Footprints')
     ax.legend()
     
     plot_time = time.time() - plot_start_time
@@ -715,16 +853,17 @@ def update_plot():
 
 # Update function for sliders
 def update(_):
-    global start_point, goal_point, start_idx, goal_idx, path_found
+    global start_point, goal_point, start_idx, goal_idx, path_found, robot_width, robot_length
     
     # Update start and goal from sliders
     start_point = np.array([s_start_x.val, s_start_y.val, s_start_z.val])
     goal_point = np.array([s_goal_x.val, s_goal_y.val, s_goal_z.val])
     
+    # Update robot dimensions
+    robot_width = s_robot_width.val
+    robot_length = s_robot_length.val
+    
     # Find nearest navigable points
-    # start_idx = tree.query(start_point)[1]
-    # goal_idx = tree.query(goal_point)[1]
-
     start_idx = gpu_index_empty.search(start_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
     goal_idx = gpu_index_empty.search(goal_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
     
