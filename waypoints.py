@@ -90,346 +90,383 @@ grid_points_f32 = grid_points.astype(np.float32)
 D_g, I_g = gpu_index_obstacles.search(grid_points_f32, 1)
 distances = np.sqrt(D_g[:, 0])
 empty_space_points = grid_points[distances > min_obstacle_distance]
+faiss_res = faiss.StandardGpuResources()
+print("Using CuPy and FAISS for GPU acceleration")
+gpu_accelerated = True
+import cupy as cp
+def cpu_raycasting_fallback(obstacle_points, grid_min, grid_max, cell_size):
+    print("Warning: CPU fallback not fully implemented.")
+    return np.empty((0, 3))
 
-def improved_look_down_algorithm(obstacle_points, grid_min, grid_max, cell_size=0.1, height_intervals=3):
+def check_clearance_faiss_gpu(potential_hits, obstacle_points_f32, min_clearance, cell_size, gpu_index_obstacles):
+    """Checks clearance above potential hit points using FAISS GPU index with kNN search."""
+    if len(potential_hits) == 0:
+        return np.array([], dtype=bool)
+
+    # Define clearance check points above the hit surface
+    check_points = potential_hits.copy()
+    check_points[:, 2] += min_clearance / 2.0
+    check_points_f32 = check_points.astype(np.float32)
+    
+    # Search radius squared (used for filtering distances)
+    threshold_sq = ((min_clearance / 2.0) + (cell_size / 2.0))**2
+    
+    # Use k-nearest neighbor search instead of range search
+    k = 10  # Check several closest points to ensure we don't miss anything
+    D, I = gpu_index_obstacles.search(check_points_f32, k)
+    
+    # For each query point, check if any of the k nearest neighbors are too close
+    clearance_ok = np.all(D > threshold_sq, axis=1)
+    
+    return clearance_ok
+
+
+def improved_look_down_algorithm_multi_start(
+    obstacle_points, grid_min, grid_max, cell_size=0.1,
+    num_z_levels=5, min_clearance=0.5, batch_size=10000
+):
     """
-    Improved 'look down' algorithm that can detect surfaces under overhangs,
-    accelerated with CuPy for parallel cell dropping.
-    
+    Ray casting algorithm with multiple start heights to find surfaces under overhangs.
+
     Args:
-        obstacle_points: The obstacle point cloud
-        grid_min: Minimum coordinates of the grid
-        grid_max: Maximum coordinates of the grid
-        cell_size: Size of each cubic cell (default: 0.1 = 10cm)
-        height_intervals: Number of different heights to test from (default: 3)
-    
+        obstacle_points: The obstacle point cloud (N x 3 numpy array)
+        grid_min: Minimum coordinates of the grid (3-element array/list)
+        grid_max: Maximum coordinates of the grid (3-element array/list)
+        cell_size: Size of each cell (default: 0.1)
+        num_z_levels: Number of different Z heights to start rays from (default: 5)
+        min_clearance: Minimum vertical clearance required above a supported cell (default: 0.5)
+        batch_size: Number of rays to process per GPU batch (default: 10000)
+
     Returns:
         Array of points representing the centers of supported cells
     """
-    print("Applying CuPy-accelerated improved look down algorithm...")
+    if not gpu_accelerated:
+        print("GPU acceleration not available. Aborting.")
+        # Or call a CPU fallback if implemented
+        return cpu_raycasting_fallback(obstacle_points, grid_min, grid_max, cell_size)
+
+    print(f"Applying multi-start GPU ray casting (Z levels={num_z_levels})...")
     start_time = time.time()
-    
-    # Import CuPy
-    try:
-        import cupy as cp
-        print("Using CuPy for GPU acceleration")
-    except ImportError:
-        print("CuPy not installed. Please install with: pip install cupy-cuda11x (replace x with your CUDA version)")
-        print("Falling back to CPU implementation")
-        # Call the original implementation if CuPy isn't available
-        return improved_look_down_algorithm_original(obstacle_points, grid_min, grid_max, cell_size, height_intervals)
-    
-    # Prepare grid for cell centers
-    x_cells = np.arange(grid_min[0] + cell_size/2, grid_max[0], cell_size)
-    y_cells = np.arange(grid_min[1] + cell_size/2, grid_max[1], cell_size)
-    
-    # Calculate height intervals
-    z_starts = np.linspace(grid_max[2], grid_min[2] + cell_size, height_intervals)
-    
-    # Create GPU array for obstacle points
+
+    # --- 1. Prepare Grid and Ray Origins ---
+    x_cells = np.arange(grid_min[0] + cell_size / 2, grid_max[0], cell_size)
+    y_cells = np.arange(grid_min[1] + cell_size / 2, grid_max[1], cell_size)
+    # Define multiple Z starting heights
+    z_starts = np.linspace(grid_max[2] + cell_size, grid_min[2] + min_clearance, num_z_levels) # Ensure lowest start is above min clearance needs
+
+    xx, yy, zz = np.meshgrid(x_cells, y_cells, z_starts)
+    ray_origins_x = xx.flatten()
+    ray_origins_y = yy.flatten()
+    ray_origins_z = zz.flatten()
+
+    num_rays = len(ray_origins_x)
+    print(f"Total rays to cast: {num_rays} ({len(x_cells)}x{len(y_cells)}x{num_z_levels})")
+
+    ray_origins = np.column_stack([ray_origins_x, ray_origins_y, ray_origins_z]).astype(np.float32)
+    ray_directions = np.zeros((num_rays, 3), dtype=np.float32)
+    ray_directions[:, 2] = -1.0 # Pointing down
+
+    # --- 2. Prepare GPU Data ---
+    cp_ray_origins = cp.asarray(ray_origins)
+    cp_ray_directions = cp.asarray(ray_directions)
     cp_obstacle_points = cp.asarray(obstacle_points.astype(np.float32))
-    
-    # Create cell grid - each cell is represented by its position
-    nx, ny, nz = len(x_cells), len(y_cells), len(z_starts)
-    print(f"Grid dimensions: {nx} × {ny} × {nz} = {nx*ny*nz} potential cells")
-    
-    # Define CUDA kernel for cell dropping
-    cell_drop_kernel = cp.ElementwiseKernel(
-        'float32 x, float32 y, float32 z_start, float32 grid_min_z, float32 cell_size, raw float32 obstacles',
-        'float32 result_x, float32 result_y, float32 result_z, int32 is_valid',
+    obstacle_points_f32 = obstacle_points.astype(np.float32) # Keep a CPU copy for FAISS index building
+
+    # Build FAISS index for obstacles (used for clearance check later)
+    print("Building FAISS GPU index for obstacles...")
+    index_obstacles = faiss.IndexFlatL2(3) # Using L2 distance
+    gpu_index_obstacles = faiss.index_cpu_to_gpu(faiss_res, 0, index_obstacles)
+    gpu_index_obstacles.add(obstacle_points_f32)
+    print(f"FAISS index built with {gpu_index_obstacles.ntotal} points.")
+
+
+    # --- 3. Define Simplified Ray Intersection Kernel ---
+    # Kernel now *only* finds the first hit point. Clearance check is done later.
+    simple_ray_intersection_kernel = cp.ElementwiseKernel(
+        'float32 ox, float32 oy, float32 oz, float32 dx, float32 dy, float32 dz, ' +
+        'float32 grid_min_z, float32 cell_sz, raw float32 obstacles', # Renamed cell_size to cell_sz
+        'float32 hit_x, float32 hit_y, float32 hit_z, int32 is_hit', # Output only hit info
         '''
-        const float half_size = cell_size / 2.0f;
-        float z = z_start;
-        bool cell_placed = false;
-        
-        // Start dropping the cell
-        while (z >= grid_min_z + half_size && !cell_placed) {
-            // Check collision with obstacles
-            float min_dist_squared = 1e10f;  // Large initial value
-            
-            for (int i = 0; i < obstacles.size() / 3; i++) {
-                float ox = obstacles[i*3];
-                float oy = obstacles[i*3+1];
-                float oz = obstacles[i*3+2];
-                
-                // Check each corner
-                float corners[8][3] = {
-                    {x-half_size, y-half_size, z-half_size},
-                    {x+half_size, y-half_size, z-half_size},
-                    {x-half_size, y+half_size, z-half_size},
-                    {x+half_size, y+half_size, z-half_size},
-                    {x-half_size, y-half_size, z+half_size},
-                    {x+half_size, y-half_size, z+half_size},
-                    {x-half_size, y+half_size, z+half_size},
-                    {x+half_size, y+half_size, z+half_size}
-                };
-                
-                for (int c = 0; c < 8; c++) {
-                    float dx = corners[c][0] - ox;
-                    float dy = corners[c][1] - oy;
-                    float dz = corners[c][2] - oz;
-                    float dist_squared = dx*dx + dy*dy + dz*dz;
-                    min_dist_squared = min(min_dist_squared, dist_squared);
-                }
-            }
-            
-            float min_dist = sqrt(min_dist_squared);
-            
-            if (min_dist < half_size) {  // Collision with obstacles
-                // Move up a bit to avoid intersection
-                z += half_size;
-                
-                // Check for clearance above to ensure robot can stand here
-                float clearance_height = 0.5f;  // Height clearance for robot
-                bool clearance_ok = true;
-                
-                for (int i = 0; i < obstacles.size() / 3; i++) {
-                    float ox = obstacles[i*3];
-                    float oy = obstacles[i*3+1];
-                    float oz = obstacles[i*3+2];
-                    
-                    float dx = x - ox;
-                    float dy = y - oy;
-                    float dz = (z + clearance_height) - oz;
-                    float dist_squared = dx*dx + dy*dy + dz*dz;
-                    
-                    if (sqrt(dist_squared) <= clearance_height) {
-                        clearance_ok = false;
-                        break;
+        const float ray_epsilon = 0.0001f;
+        const float max_dist = oz - grid_min_z + cell_sz; // Max ray distance down to below grid floor
+        const float point_radius_sq = (cell_sz * 0.4f) * (cell_sz * 0.4f); // Approx point influence (squared), slightly smaller than half cell
+
+        is_hit = 0;
+        hit_x = ox; // Default to origin X
+        hit_y = oy; // Default to origin Y
+        hit_z = 0.0f; // Default Z
+        float closest_t = max_dist;
+
+        int num_obstacles = obstacles.size() / 3;
+
+        for (int i = 0; i < num_obstacles; i++) {
+            float px = obstacles[i*3 + 0];
+            float py = obstacles[i*3 + 1];
+            float pz = obstacles[i*3 + 2];
+
+            // Simplified check: Distance from point to ray origin projected onto ray path
+            // This is a faster approximation than sphere intersection for dense points
+            float oc_x = px - ox;
+            float oc_y = py - oy;
+            float oc_z = pz - oz;
+
+            float proj_t = oc_x * dx + oc_y * dy + oc_z * dz; // Ray direction is normalized (length 1 in Z)
+
+            // Check if point is generally 'in front' of the ray origin along its path
+            if (proj_t > ray_epsilon) {
+                // Calculate closest point on ray to obstacle point p
+                float closest_pt_x = ox + proj_t * dx;
+                float closest_pt_y = oy + proj_t * dy;
+                float closest_pt_z = oz + proj_t * dz;
+
+                // Calculate squared distance from obstacle point to the ray line
+                float dist_sq = (px - closest_pt_x)*(px - closest_pt_x) +
+                                (py - closest_pt_y)*(py - closest_pt_y) +
+                                (pz - closest_pt_z)*(pz - closest_pt_z);
+
+                if (dist_sq < point_radius_sq) {
+                    // Ray passes close enough to the point
+                    // Use the projection distance 'proj_t' as the hit distance 't'
+                    if (proj_t < closest_t) {
+                         closest_t = proj_t;
+                         is_hit = 1;
+                         // We only store 't', hit point calculated later if needed
                     }
                 }
-                
-                if (clearance_ok) {
-                    result_x = x;
-                    result_y = y;
-                    result_z = z;
-                    is_valid = 1;
-                } else {
-                    is_valid = 0;
-                }
-                
-                cell_placed = true;
-            } else {
-                // Drop the cell further down
-                z -= cell_size/4.0f;  // Use smaller steps for more precision
             }
-        }
-        
-        // If we reached the bottom with no collision, place at ground level
-        if (!cell_placed) {
-            result_x = x;
-            result_y = y;
-            result_z = grid_min_z + half_size;
-            is_valid = 1;
-        }
-        ''',
-        'cell_drop_kernel'
-    )
-    
-    # For large point clouds, we need to use a more efficient approach with batch processing
-    # Use FAISS for obstacle queries instead of the kernel handling all obstacles
-    # This is a hybrid approach where we'll use CuPy for parallelization and FAISS for nearest neighbor searches
-    
-    # Prepare data for parallel processing
-    all_cells = []
-    batch_size = 10000  # Process cells in batches to avoid GPU memory issues
-    
-    for z_start in z_starts:
-        # Create meshgrid for this z-level
-        xx, yy = np.meshgrid(x_cells, y_cells)
-        x_flat = xx.flatten()
-        y_flat = yy.flatten()
-        z_flat = np.full_like(x_flat, z_start)
-        
-        # Process in batches
-        for i in range(0, len(x_flat), batch_size):
-            end_idx = min(i + batch_size, len(x_flat))
-            batch_x = cp.asarray(x_flat[i:end_idx].astype(np.float32))
-            batch_y = cp.asarray(y_flat[i:end_idx].astype(np.float32))
-            batch_z = cp.asarray(z_flat[i:end_idx].astype(np.float32))
-            
-            # Allocate output arrays
-            batch_size_actual = len(batch_x)
-            result_x = cp.zeros(batch_size_actual, dtype=cp.float32)
-            result_y = cp.zeros(batch_size_actual, dtype=cp.float32)
-            result_z = cp.zeros(batch_size_actual, dtype=cp.float32)
-            is_valid = cp.zeros(batch_size_actual, dtype=cp.int32)
-            
-            # Use pre-computed FAISS index instead of the full kernel obstacle check
-            half_size = cell_size / 2.0
-            
-            # Create batch of cell corners for FAISS query
-            corners_batch = []
-            for j in range(batch_size_actual):
-                x, y, z = float(batch_x[j]), float(batch_y[j]), float(batch_z[j])
-                corners = np.array([
-                    [x-half_size, y-half_size, z-half_size],
-                    [x+half_size, y-half_size, z-half_size],
-                    [x-half_size, y+half_size, z-half_size],
-                    [x+half_size, y+half_size, z-half_size],
-                    [x-half_size, y-half_size, z+half_size],
-                    [x+half_size, y-half_size, z+half_size],
-                    [x-half_size, y+half_size, z+half_size],
-                    [x+half_size, y+half_size, z+half_size],
-                ]).astype(np.float32)
-                corners_batch.append(corners)
-            
-            # Process each cell in the batch
-            for j in range(batch_size_actual):
-                x, y, z = float(batch_x[j]), float(batch_y[j]), float(batch_z[j])
-                cell_placed = False
-                
-                # Start dropping the cell
-                while z >= grid_min[2] + half_size and not cell_placed:
-                    # Define cell corners for collision check
-                    corners = corners_batch[j].copy()
-                    corners[:, 2] = z + np.array([-1, -1, -1, -1, 1, 1, 1, 1]) * half_size
-                    
-                    # Check if cell collides with obstacles using FAISS
-                    D_corners, _ = gpu_index_obstacles.search(corners, 1)
-                    min_dist = np.min(np.sqrt(D_corners))
-                    
-                    if min_dist < half_size:  # Collision with obstacles
-                        # Move up a bit to avoid intersection
-                        z += half_size
-                        
-                        # Check for clearance above to ensure robot can stand here
-                        clearance_check = np.array([[x, y, z + 0.5]]).astype(np.float32)
-                        D_clearance, _ = gpu_index_obstacles.search(clearance_check, 1)
-                        
-                        if np.sqrt(D_clearance[0, 0]) > 0.5:  # Ensure enough vertical clearance for robot
-                            # Valid cell found
-                            result_x[j] = x
-                            result_y[j] = y
-                            result_z[j] = z
-                            is_valid[j] = 1
-                        
-                        cell_placed = True
-                    else:
-                        # Drop the cell further down
-                        z -= cell_size/4  # Use smaller steps for more precision
-                        corners_batch[j][:, 2] -= cell_size/4
-                
-                # If we reached the bottom with no collision, place at ground level
-                if not cell_placed:
-                    result_x[j] = x
-                    result_y[j] = y 
-                    result_z[j] = grid_min[2] + half_size
-                    is_valid[j] = 1
-            
-            # Get results back to CPU and append valid cells
-            result_x_cpu = cp.asnumpy(result_x)
-            result_y_cpu = cp.asnumpy(result_y)
-            result_z_cpu = cp.asnumpy(result_z)
-            is_valid_cpu = cp.asnumpy(is_valid)
-            
-            # Filter valid cells and add to results
-            valid_indices = np.where(is_valid_cpu == 1)[0]
-            for idx in valid_indices:
-                all_cells.append([result_x_cpu[idx], result_y_cpu[idx], result_z_cpu[idx]])
-    
-    # Convert to numpy array
-    supported_cells = np.array(all_cells) if all_cells else np.empty((0, 3))
-    
-    # Post-process: Remove duplicate cells at similar heights
-    if len(supported_cells) > 0:
-        # Create dictionary to track cells by xy position
-        placed_cells_dict = {}
-        final_cells = []
-        
-        for cell in supported_cells:
-            x, y, z = cell
-            xy_key = f"{int(x*100)}_{int(y*100)}"
-            
-            if xy_key in placed_cells_dict:
-                # Check if we already have a cell at a similar height
-                too_close = False
-                for existing_z in placed_cells_dict[xy_key]:
-                    if abs(existing_z - z) < cell_size*2:
-                        too_close = True
-                        break
-                
-                if not too_close and len(placed_cells_dict[xy_key]) < 5:
-                    placed_cells_dict[xy_key].append(z)
-                    final_cells.append(cell)
-            else:
-                placed_cells_dict[xy_key] = [z]
-                final_cells.append(cell)
-        
-        supported_cells = np.array(final_cells)
-    
-    # Log timing information
-    elapsed_time = time.time() - start_time
-    print(f"CuPy-accelerated look down algorithm completed in {elapsed_time:.2f} seconds")
-    print(f"Generated {len(supported_cells)} supported cells")
-    
-    # Add connectivity information
-    print("Analyzing connectivity between cells...")
-    
-    # Create a graph of connected cells to identify isolated cells
-    if len(supported_cells) > 0:
-        connect_supported_cells(supported_cells, cell_size)
-    
-    return supported_cells
+        } // End loop through obstacles
 
-def connect_supported_cells(supported_cells, cell_size):
+        // If hit, calculate precise hit point
+        if (is_hit == 1) {
+             hit_x = ox + closest_t * dx;
+             hit_y = oy + closest_t * dy;
+             hit_z = oz + closest_t * dz;
+
+             // Ensure hit is not below the grid floor (can happen with approximations)
+             if (hit_z < grid_min_z) {
+                 is_hit = 0; // Invalidate hit if it ends up below floor
+             }
+        } else {
+            // Option 1: If no obstacle hit, the ray reaches the ground implicitly.
+            // We don't mark this as a hit here, handle ground plane later if needed.
+            // Option 2: Mark ground as hit (less flexible if ground isn't flat)
+            // hit_x = ox; hit_y = oy; hit_z = grid_min_z; is_hit = 1; // If desired
+             is_hit = 0; // Prefer finding actual obstacle hits
+        }
+
+        ''',
+        'simple_ray_intersection_kernel'
+    )
+
+    # --- 4. Execute Kernel in Batches ---
+    print("Running ray intersection kernel...")
+    all_potential_hits = []
+    all_is_hit = []
+
+    for i in range(0, num_rays, batch_size):
+        end_idx = min(i + batch_size, num_rays)
+        batch_origins = cp_ray_origins[i:end_idx]
+        batch_directions = cp_ray_directions[i:end_idx]
+        batch_size_actual = end_idx - i
+
+        # Prepare output arrays for the batch
+        hit_x = cp.zeros(batch_size_actual, dtype=cp.float32)
+        hit_y = cp.zeros(batch_size_actual, dtype=cp.float32)
+        hit_z = cp.zeros(batch_size_actual, dtype=cp.float32)
+        is_hit = cp.zeros(batch_size_actual, dtype=cp.int32)
+
+        # Execute kernel
+        simple_ray_intersection_kernel(
+            batch_origins[:, 0], batch_origins[:, 1], batch_origins[:, 2],
+            batch_directions[:, 0], batch_directions[:, 1], batch_directions[:, 2],
+            grid_min[2], cell_size, cp_obstacle_points, # Pass grid_min_z and cell_size
+            hit_x, hit_y, hit_z, is_hit
+        )
+
+        # Get results back to CPU
+        batch_hits_xyz = cp.asnumpy(cp.stack([hit_x, hit_y, hit_z], axis=-1))
+        batch_is_hit = cp.asnumpy(is_hit)
+
+        # Store results
+        all_potential_hits.append(batch_hits_xyz)
+        all_is_hit.append(batch_is_hit)
+
+        # Optional: print progress
+        # print(f"Processed batch {i // batch_size + 1}/{(num_rays + batch_size - 1) // batch_size}")
+
+
+    # Concatenate results from all batches
+    potential_hits_np = np.concatenate(all_potential_hits, axis=0)
+    is_hit_np = np.concatenate(all_is_hit, axis=0)
+
+    # Filter out rays that didn't hit anything
+    valid_hit_indices = np.where(is_hit_np == 1)[0]
+    actual_hits = potential_hits_np[valid_hit_indices]
+    print(f"Found {len(actual_hits)} potential hit points.")
+
+    # --- 5. Check Clearance using FAISS ---
+    print(f"Checking clearance ({min_clearance}m) for potential hits...")
+    if len(actual_hits) > 0:
+        clearance_ok = check_clearance_faiss_gpu(
+            actual_hits, obstacle_points_f32, min_clearance, cell_size, gpu_index_obstacles
+        )
+        supported_hits = actual_hits[clearance_ok]
+        print(f"Found {len(supported_hits)} hits with sufficient clearance.")
+    else:
+        supported_hits = np.empty((0, 3))
+        print("No potential hits found, skipping clearance check.")
+
+    # --- Optional: Add ground plane cells ---
+    # If desired, add ground cells where no obstacles were hit *and* clearance is guaranteed
+    # This requires tracking which XY cells never had a valid hit + clearance check for ground points.
+    # For simplicity, we focus on hits on obstacles first.
+
+    # --- 6. Post-process: Consolidate and Remove Duplicates ---
+    # Use the dictionary approach to handle multiple Z hits in the same XY column
+    # and remove hits that are too close vertically.
+    supported_cells = []
+    if len(supported_hits) > 0:
+        print("Consolidating results and removing close duplicates...")
+        placed_cells_dict = {}
+        # Sort by Z descending, so we prioritize higher surfaces if they are too close
+        sorted_indices = np.argsort(supported_hits[:, 2])[::-1]
+        sorted_supported_hits = supported_hits[sorted_indices]
+
+        for cell in sorted_supported_hits:
+            x, y, z = cell
+            # Create a key based on discretized XY coordinates
+            xy_key = f"{int(x / cell_size)}_{int(y / cell_size)}"
+
+            if xy_key not in placed_cells_dict:
+                placed_cells_dict[xy_key] = [z]
+                supported_cells.append(cell)
+            else:
+                # Check if this hit is too close to existing hits in this column
+                is_too_close = False
+                for existing_z in placed_cells_dict[xy_key]:
+                    if abs(existing_z - z) < cell_size: # Check if vertically too close
+                        is_too_close = True
+                        break
+                if not is_too_close:
+                    placed_cells_dict[xy_key].append(z)
+                    supported_cells.append(cell)
+                    # Optional limit on number of surfaces per column:
+                    # if len(placed_cells_dict[xy_key]) >= max_surfaces_per_column:
+                    #     break # Or handle differently
+
+        supported_cells = np.array(supported_cells) if supported_cells else np.empty((0, 3))
+
+    elapsed_time = time.time() - start_time
+    print(f"Multi-start ray casting completed in {elapsed_time:.2f} seconds")
+    print(f"Generated {len(supported_cells)} final supported cells")
+
+    # --- 7. Connectivity Analysis (Optional but Recommended) ---
+    if len(supported_cells) > 0:
+        print("Analyzing connectivity...")
+        # Assuming connect_supported_cells uses FAISS GPU index internally
+        G = connect_supported_cells(supported_cells, cell_size, gpu_index_obstacles.res) # Pass faiss resources
+    else:
+        G = None # Or nx.Graph()
+
+    # Cleanup FAISS GPU resources if they are not needed elsewhere
+    # del gpu_index_obstacles # Or manage resource lifetime appropriately
+
+    return supported_cells, G # Return graph too
+
+def connect_supported_cells(supported_cells, cell_size, faiss_res=None):
     """
-    Build a connectivity graph between supported cells and identify isolated regions
+    Build a connectivity graph between supported cells using FAISS GPU.
+    Identifies connected components and isolated regions.
+    Args:
+        supported_cells (np.array): Nx3 array of cell centers.
+        cell_size (float): The size of the cells.
+        faiss_res (faiss.GpuResources, optional): Pre-initialized FAISS GPU resources. Defaults to None.
+    Returns:
+        networkx.Graph: Graph where nodes are cell indices and edges connect nearby cells.
     """
-    # Create FAISS index for supported cells
+    if len(supported_cells) < 2:
+        print("Not enough cells to build connectivity graph.")
+        return nx.Graph()
+        
+    if faiss_res is None:
+         # Initialize resources if not provided (less efficient if called multiple times)
+         print("Initializing temporary FAISS GPU resources for connectivity.")
+         faiss_res = faiss.StandardGpuResources()
+
+
+    print("Building FAISS index for supported cells...")
     supported_cells_f32 = supported_cells.astype(np.float32)
-    res_support = faiss.StandardGpuResources()
     support_index = faiss.IndexFlatL2(3)
-    gpu_support_index = faiss.index_cpu_to_gpu(res_support, 0, support_index)
+    gpu_support_index = faiss.index_cpu_to_gpu(faiss_res, 0, support_index)
     gpu_support_index.add(supported_cells_f32)
-    
-    # Find connections between nearby cells
     G = nx.Graph()
-    
-    # Add all cells as nodes
-    for i in range(len(supported_cells)):
-        G.add_node(i)
-    
-    # Connect nearby cells (within 1.5 * cell_size)
-    connection_threshold = cell_size * 1.5
-    
-    # Batch processing for large cell arrays
-    batch_size = 1000
-    for i in range(0, len(supported_cells), batch_size):
-        batch_end = min(i + batch_size, len(supported_cells))
-        batch = supported_cells_f32[i:batch_end]
-        
-        # Search for nearby cells
-        D, I = gpu_support_index.search(batch, 10)  # Find 10 nearest neighbors
-        
-        # Process results
-        for j in range(len(batch)):
+    G.add_nodes_from(range(len(supported_cells)))
+
+    # Connect nearby cells (within sqrt(2) * cell_size for adjacent, maybe slightly more for diagonal/vertical)
+    connection_threshold_sq = (cell_size * 1.5)**2 # Squared distance threshold
+    k_neighbors = 10 # Search for up to 10 nearest neighbors
+
+    print(f"Finding connections within radius {connection_threshold_sq**0.5:.3f}...")
+    # Batch processing for potentially large number of supported cells
+    batch_size = 5000
+    num_cells = len(supported_cells)
+
+    for i in range(0, num_cells, batch_size):
+        batch_end = min(i + batch_size, num_cells)
+        # Query points directly on GPU
+        batch_query_cp = cp.asarray(supported_cells_f32[i:batch_end])
+
+        # Use range search for fixed radius or knn search and filter by distance
+        # Let's use knn search and filter, might be more robust than guessing radius
+        D, I = gpu_support_index.search(batch_query_cp, k_neighbors) # D is squared distances
+
+        # Process results (can potentially stay on GPU longer if needed)
+        D_cpu = cp.asnumpy(D)
+        I_cpu = cp.asnumpy(I)
+
+        for j in range(len(batch_query_cp)): # Loop through query points in the batch
             cell_idx = i + j
-            for k in range(10):
-                neighbor_idx = I[j, k]
-                if neighbor_idx != cell_idx and neighbor_idx < len(supported_cells):
-                    dist = np.sqrt(D[j, k])
-                    if dist <= connection_threshold:
-                        # Cells are close enough to be connected
-                        G.add_edge(cell_idx, neighbor_idx, weight=dist)
-    
+            for k in range(1, k_neighbors): # Start from 1 to skip self-comparison
+                neighbor_idx = I_cpu[j, k]
+                dist_sq = D_cpu[j, k]
+
+                # Check if neighbor is valid and within threshold
+                if neighbor_idx >= 0 and neighbor_idx < num_cells and neighbor_idx != cell_idx:
+                    if dist_sq <= connection_threshold_sq:
+                        # Check vertical distance constraint if needed (e.g., robot can't step too high)
+                        z_diff = abs(supported_cells[cell_idx, 2] - supported_cells[neighbor_idx, 2])
+                        if z_diff < cell_size * 1.1: # Allow stepping up/down one cell height
+                            G.add_edge(cell_idx, neighbor_idx, weight=dist_sq**0.5)
+                    else:
+                        # Since neighbors are sorted by distance, we can stop early for this query point
+                        break
+                        
+        # print(f"Processed connectivity batch {i // batch_size + 1}/{(num_cells + batch_size - 1) // batch_size}")
+
+
     # Find connected components
     components = list(nx.connected_components(G))
-    print(f"Found {len(components)} connected regions")
-    
-    # Identify the largest component
-    largest_component = max(components, key=len)
-    print(f"Largest connected region has {len(largest_component)} cells")
-    
-    # Count isolated cells (not in the largest component)
-    isolated_cells = sum(len(c) for c in components if c != largest_component)
-    print(f"Found {isolated_cells} isolated cells in {len(components)-1} smaller regions")
-    
+    print(f"Found {len(components)} connected regions.")
+
+    if components:
+        largest_component = max(components, key=len)
+        print(f"Largest connected region has {len(largest_component)} cells.")
+        isolated_cells = num_cells - len(largest_component)
+        num_isolated_regions = len(components) - 1
+        if num_isolated_regions > 0:
+             print(f"Found {isolated_cells} isolated cells in {num_isolated_regions} smaller regions.")
+    else:
+        print("Graph has no components.")
+        
+    # Cleanup index (optional, depends on resource management)
+    # del gpu_support_index
+
     return G
 
 # Apply the improved algorithm
-cell_size = 0.5  # (can adjust based on your robot size)
-supported_cells = improved_look_down_algorithm(obstacle_points, min_vals, max_vals, cell_size, height_intervals=5)
+cell_size = 0.1  # (can adjust based on your robot size)
+supported_cells, G = improved_look_down_algorithm_multi_start(obstacle_points=obstacle_points, 
+    grid_min=min_vals, grid_max=max_vals, cell_size=cell_size, num_z_levels=5, min_clearance=0.001)
 
 # Visualize the supported cells
 def visualize_supported_cells_3d():
@@ -510,7 +547,7 @@ kdtree_time = time.time() - start_time
 
 # Timing: Graph creation of navigable empty space
 start_time = time.time()
-G = nx.Graph()
+# G = nx.Graph()
 # k_neighbors = 30  # Connect each point to its k nearest neighbors
 # for i, p in enumerate(empty_space_points):
 #     neighbors = tree.query(p, k=k_neighbors+1)[1][1:]  # Skip self
@@ -526,7 +563,7 @@ G = nx.Graph()
 #             # Path is clear, add edge
 #             G.add_edge(i, n, weight=np.linalg.norm(empty_space_points[i] - empty_space_points[n]))
 start_time = time.time()
-G = nx.Graph()
+# G = nx.Graph()
 k_neighbors = 30
 D_es, I_es = gpu_index_empty.search(empty_space_points_f32, k_neighbors + 1)
 for i in range(len(empty_space_points)):
