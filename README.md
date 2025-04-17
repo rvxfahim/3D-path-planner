@@ -41,10 +41,10 @@ The core script is [waypoints.py](waypoints.py), which:
 - GPU‑accelerated nearest‑neighbor queries via FAISS  
 - Multi‑start ray casting with CuPy kernels  
 - Clearance checks using \(d > r\) where  
-  \[
-    d = \sqrt{(x_o - x_p)^2 + (y_o - y_p)^2 + (z_o - z_p)^2}\,, 
-    \quad r = \text{clearance radius}
-  \]  
+$$
+d = \sqrt{(x_o - x_p)^2 + (y_o - y_p)^2 + (z_o - z_p)^2}, \quad r = \text{clearance radius}
+$$
+
 - Duplicate removal with vertical threshold  
 - Connectivity graph built with [`networkx`](https://networkx.org/)  
 - A* path planning on the graph  
