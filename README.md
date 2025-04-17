@@ -91,7 +91,8 @@ $$
 
 ### 2. Ray‑Casting Kernel
 
-- For each ray origin 
+- For each ray origin
+
 $$
 \(\mathbf{o}\) and direction \(\mathbf{d}=(0,0,-1)\)
 $$
