@@ -81,27 +81,33 @@ pip install faiss-cpu cupy-cuda11x numpy scipy networkx matplotlib pandas pyvist
 ### 1. Grid & Ray Origins
 
 - Grid cell centers \( (x_i, y_j, z_k) \) are defined by
-  $$
-    x_i = x_{\min} + \frac{\Delta x}{2} + i\,\Delta x,\quad
-    y_j = y_{\min} + \frac{\Delta y}{2} + j\,\Delta y
-  $$
+
+$$
+x_i = x_{\min} + \frac{\Delta x}{2} + i\,\Delta x,\quad
+y_j = y_{\min} + \frac{\Delta y}{2} + j\,\Delta y
+$$
+
 - Multiple start heights \( z_k \) linearly spaced above obstacles.
 
 ### 2. Ray‑Casting Kernel
 
 - For each ray origin \(\mathbf{o}\) and direction \(\mathbf{d}=(0,0,-1)\), we approximate intersection by checking:
-  $$
-    \mathrm{proj}_t = (\mathbf{p}-\mathbf{o})\cdot\mathbf{d},\quad
-    \|\mathbf{p}- (\mathbf{o}+t\mathbf{d})\|^2 < r^2
-  $$
+
+$$
+\mathrm{proj}_t = (\mathbf{p}-\mathbf{o})\cdot\mathbf{d},\quad
+\|\mathbf{p}- (\mathbf{o}+t\mathbf{d})\|^2 < r^2
+$$
+
 - Implemented as a [CuPy ElementwiseKernel](waypoints.py).
 
 ### 3. Clearance Check
 
 - For each hit point \(\mathbf{h}\), verify no obstacle lies within a sphere of radius \(r\) above:
-  $$
-    \|\mathbf{q} - (\mathbf{h} + r\,\mathbf{e}_z)\| > r\;\;\forall\,\mathbf{q}\in\text{obstacles}
-  $$
+
+$$
+\|\mathbf{q} - (\mathbf{h} + r\,\mathbf{e}_z)\| > r\;\;\forall\,\mathbf{q}\in\text{obstacles}
+$$
+
 
 ### 4. Connectivity Graph
 
