@@ -144,15 +144,3 @@ Refer to [waypoints.py](waypoints.py) for full signatures and docstrings.
 This project is licensed under **GNU GPL v2**. See [LICENSE.GPL](LICENSE.GPL) for details.
 
 ---
-
-## Contact
-
-- **Author**: Your Name  
-- **Email**: your.email@example.com  
-- **Address**:  
-  ```
-  Your Organization
-  Street Address
-  City, State, ZIP
-  Country
-  ```
