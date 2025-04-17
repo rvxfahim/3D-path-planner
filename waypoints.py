@@ -141,8 +141,13 @@ def check_clearance_faiss_gpu(potential_hits, obstacle_points_f32, min_clearance
 
 
 def improved_look_down_algorithm_multi_start(
-    obstacle_points, grid_min, grid_max, cell_size=0.1,
-    num_z_levels=5, min_clearance=0.5, batch_size=10000
+    obstacle_points, grid_min, grid_max,
+    grid_cell_size=0.1,               # Grid resolution for ray casting
+    point_influence_radius=None,      # Radius for point detection (default: 0.4 * grid_cell_size)
+    num_z_levels=5,                   # Number of ray starting heights
+    min_clearance=0.5,                # Minimum vertical clearance required
+    vertical_duplicate_threshold=None, # Distance for merging cells vertically (default: grid_cell_size)
+    batch_size=10000                  # GPU batch processing size
 ):
     """
     Ray casting algorithm with multiple start heights to find surfaces under overhangs.
@@ -151,9 +156,11 @@ def improved_look_down_algorithm_multi_start(
         obstacle_points: The obstacle point cloud (N x 3 numpy array)
         grid_min: Minimum coordinates of the grid (3-element array/list)
         grid_max: Maximum coordinates of the grid (3-element array/list)
-        cell_size: Size of each cell (default: 0.1)
+        grid_cell_size: Size of each grid cell for ray casting (default: 0.1)
+        point_influence_radius: Radius of influence for obstacle points (default: 0.4 * grid_cell_size)
         num_z_levels: Number of different Z heights to start rays from (default: 5)
         min_clearance: Minimum vertical clearance required above a supported cell (default: 0.5)
+        vertical_duplicate_threshold: Distance threshold for merging vertical duplicates (default: grid_cell_size)
         batch_size: Number of rays to process per GPU batch (default: 10000)
 
     Returns:
@@ -162,16 +169,23 @@ def improved_look_down_algorithm_multi_start(
     if not gpu_accelerated:
         print("GPU acceleration not available. Aborting.")
         # Or call a CPU fallback if implemented
-        return cpu_raycasting_fallback(obstacle_points, grid_min, grid_max, cell_size)
+        return cpu_raycasting_fallback(obstacle_points, grid_min, grid_max, grid_cell_size)
+
+    # Set default values for parameters if not provided
+    if point_influence_radius is None:
+        point_influence_radius = 0.4 * grid_cell_size
+        
+    if vertical_duplicate_threshold is None:
+        vertical_duplicate_threshold = grid_cell_size
 
     print(f"Applying multi-start GPU ray casting (Z levels={num_z_levels})...")
     start_time = time.time()
 
     # --- 1. Prepare Grid and Ray Origins ---
-    x_cells = np.arange(grid_min[0] + cell_size / 2, grid_max[0], cell_size)
-    y_cells = np.arange(grid_min[1] + cell_size / 2, grid_max[1], cell_size)
+    x_cells = np.arange(grid_min[0] + grid_cell_size / 2, grid_max[0], grid_cell_size)
+    y_cells = np.arange(grid_min[1] + grid_cell_size / 2, grid_max[1], grid_cell_size)
     # Define multiple Z starting heights
-    z_starts = np.linspace(grid_max[2] + cell_size, grid_min[2] + min_clearance, num_z_levels) # Ensure lowest start is above min clearance needs
+    z_starts = np.linspace(grid_max[2] + grid_cell_size, grid_min[2] + min_clearance, num_z_levels) # Ensure lowest start is above min clearance needs
 
     xx, yy, zz = np.meshgrid(x_cells, y_cells, z_starts)
     ray_origins_x = xx.flatten()
@@ -198,17 +212,18 @@ def improved_look_down_algorithm_multi_start(
     gpu_index_obstacles.add(obstacle_points_f32)
     print(f"FAISS index built with {gpu_index_obstacles.ntotal} points.")
 
-
     # --- 3. Define Simplified Ray Intersection Kernel ---
-    # Kernel now *only* finds the first hit point. Clearance check is done later.
+    # Calculate radius squared once - using the configurable point_influence_radius
+    point_radius_sq = point_influence_radius * point_influence_radius
+    
+    # Kernel now accepts a separate point_radius_sq parameter
     simple_ray_intersection_kernel = cp.ElementwiseKernel(
         'float32 ox, float32 oy, float32 oz, float32 dx, float32 dy, float32 dz, ' +
-        'float32 grid_min_z, float32 cell_sz, raw float32 obstacles', # Renamed cell_size to cell_sz
-        'float32 hit_x, float32 hit_y, float32 hit_z, int32 is_hit', # Output only hit info
+        'float32 grid_min_z, float32 cell_sz, raw float32 obstacles, float32 point_radius_sq',
+        'float32 hit_x, float32 hit_y, float32 hit_z, int32 is_hit',
         '''
         const float ray_epsilon = 0.0001f;
         const float max_dist = oz - grid_min_z + cell_sz; // Max ray distance down to below grid floor
-        const float point_radius_sq = (cell_sz * 0.4f) * (cell_sz * 0.4f); // Approx point influence (squared), slightly smaller than half cell
 
         is_hit = 0;
         hit_x = ox; // Default to origin X
@@ -272,7 +287,6 @@ def improved_look_down_algorithm_multi_start(
             // hit_x = ox; hit_y = oy; hit_z = grid_min_z; is_hit = 1; // If desired
              is_hit = 0; // Prefer finding actual obstacle hits
         }
-
         ''',
         'simple_ray_intersection_kernel'
     )
@@ -294,11 +308,11 @@ def improved_look_down_algorithm_multi_start(
         hit_z = cp.zeros(batch_size_actual, dtype=cp.float32)
         is_hit = cp.zeros(batch_size_actual, dtype=cp.int32)
 
-        # Execute kernel
+        # Execute kernel with the separate point_radius_sq parameter
         simple_ray_intersection_kernel(
             batch_origins[:, 0], batch_origins[:, 1], batch_origins[:, 2],
             batch_directions[:, 0], batch_directions[:, 1], batch_directions[:, 2],
-            grid_min[2], cell_size, cp_obstacle_points, # Pass grid_min_z and cell_size
+            grid_min[2], grid_cell_size, cp_obstacle_points, point_radius_sq,
             hit_x, hit_y, hit_z, is_hit
         )
 
@@ -313,7 +327,6 @@ def improved_look_down_algorithm_multi_start(
         # Optional: print progress
         # print(f"Processed batch {i // batch_size + 1}/{(num_rays + batch_size - 1) // batch_size}")
 
-
     # Concatenate results from all batches
     potential_hits_np = np.concatenate(all_potential_hits, axis=0)
     is_hit_np = np.concatenate(all_is_hit, axis=0)
@@ -327,7 +340,7 @@ def improved_look_down_algorithm_multi_start(
     print(f"Checking clearance ({min_clearance}m) for potential hits...")
     if len(actual_hits) > 0:
         clearance_ok = check_clearance_faiss_gpu(
-            actual_hits, obstacle_points_f32, min_clearance, cell_size, gpu_index_obstacles
+            actual_hits, obstacle_points_f32, min_clearance, grid_cell_size, gpu_index_obstacles
         )
         supported_hits = actual_hits[clearance_ok]
         print(f"Found {len(supported_hits)} hits with sufficient clearance.")
@@ -335,14 +348,8 @@ def improved_look_down_algorithm_multi_start(
         supported_hits = np.empty((0, 3))
         print("No potential hits found, skipping clearance check.")
 
-    # --- Optional: Add ground plane cells ---
-    # If desired, add ground cells where no obstacles were hit *and* clearance is guaranteed
-    # This requires tracking which XY cells never had a valid hit + clearance check for ground points.
-    # For simplicity, we focus on hits on obstacles first.
-
     # --- 6. Post-process: Consolidate and Remove Duplicates ---
-    # Use the dictionary approach to handle multiple Z hits in the same XY column
-    # and remove hits that are too close vertically.
+    # Now using the vertical_duplicate_threshold parameter instead of cell_size
     supported_cells = []
     if len(supported_hits) > 0:
         print("Consolidating results and removing close duplicates...")
@@ -351,19 +358,23 @@ def improved_look_down_algorithm_multi_start(
         sorted_indices = np.argsort(supported_hits[:, 2])[::-1]
         sorted_supported_hits = supported_hits[sorted_indices]
 
+        # Use grid_cell_size for XY grid but vertical_duplicate_threshold for Z comparison
         for cell in sorted_supported_hits:
             x, y, z = cell
-            # Create a key based on discretized XY coordinates
-            xy_key = f"{int(x / cell_size)}_{int(y / cell_size)}"
+            # Replace integer division with proper floor division
+            x_cell = int(np.floor(x / grid_cell_size))
+            y_cell = int(np.floor(y / grid_cell_size))
+            xy_key = f"{x_cell}_{y_cell}"
 
             if xy_key not in placed_cells_dict:
                 placed_cells_dict[xy_key] = [z]
                 supported_cells.append(cell)
             else:
                 # Check if this hit is too close to existing hits in this column
+                # Using vertical_duplicate_threshold for the Z comparison
                 is_too_close = False
                 for existing_z in placed_cells_dict[xy_key]:
-                    if abs(existing_z - z) < cell_size: # Check if vertically too close
+                    if abs(existing_z - z) < vertical_duplicate_threshold:
                         is_too_close = True
                         break
                 if not is_too_close:
@@ -382,8 +393,13 @@ def improved_look_down_algorithm_multi_start(
     # --- 7. Connectivity Analysis (Optional but Recommended) ---
     if len(supported_cells) > 0:
         print("Analyzing connectivity...")
-        # Assuming connect_supported_cells uses FAISS GPU index internally
-        G = connect_supported_cells(supported_cells, cell_size, faiss_res) # Pass faiss resources
+        # Use a separate connectivity parameter set instead of reusing cell_size
+        G = connect_supported_cells(
+            supported_cells, 
+            connection_radius=grid_cell_size * 1.5,  # Default connection radius 
+            max_vertical_step=grid_cell_size * 1.1,  # Default vertical step constraint
+            faiss_res=faiss_res
+        )
     else:
         G = None # Or nx.Graph()
 
@@ -392,13 +408,15 @@ def improved_look_down_algorithm_multi_start(
 
     return supported_cells, G # Return graph too
 
-def connect_supported_cells(supported_cells, cell_size, faiss_res=None):
+def connect_supported_cells(supported_cells, connection_radius=0.15, max_vertical_step=0.11, k_neighbors=30, faiss_res=None):
     """
     Build a connectivity graph between supported cells using FAISS GPU.
     Identifies connected components and isolated regions.
     Args:
         supported_cells (np.array): Nx3 array of cell centers.
-        cell_size (float): The size of the cells.
+        connection_radius (float): Maximum distance to consider cells connected (default: 0.15)
+        max_vertical_step (float): Maximum allowed vertical distance between connected cells (default: 0.11)
+        k_neighbors (int): Number of nearest neighbors to search for each cell (default: 30)
         faiss_res (faiss.GpuResources, optional): Pre-initialized FAISS GPU resources. Defaults to None.
     Returns:
         networkx.Graph: Graph where nodes are cell indices and edges connect nearby cells.
@@ -412,7 +430,6 @@ def connect_supported_cells(supported_cells, cell_size, faiss_res=None):
          print("Initializing temporary FAISS GPU resources for connectivity.")
          faiss_res = faiss.StandardGpuResources()
 
-
     print("Building FAISS index for supported cells...")
     supported_cells_f32 = supported_cells.astype(np.float32)
     support_index = faiss.IndexFlatL2(3)
@@ -421,11 +438,10 @@ def connect_supported_cells(supported_cells, cell_size, faiss_res=None):
     G = nx.Graph()
     G.add_nodes_from(range(len(supported_cells)))
 
-    # Connect nearby cells (within sqrt(2) * cell_size for adjacent, maybe slightly more for diagonal/vertical)
-    connection_threshold_sq = (cell_size * 1.5)**2 # Squared distance threshold
-    k_neighbors = 10 # Search for up to 10 nearest neighbors
+    # Square the connection radius for more efficient distance comparisons
+    connection_threshold_sq = connection_radius**2
 
-    print(f"Finding connections within radius {connection_threshold_sq**0.5:.3f}...")
+    print(f"Finding connections within radius {connection_radius:.3f}...")
     # Batch processing for potentially large number of supported cells
     batch_size = 5000
     num_cells = len(supported_cells)
@@ -435,8 +451,7 @@ def connect_supported_cells(supported_cells, cell_size, faiss_res=None):
         # Query points directly on GPU
         batch_query_cp = cp.asarray(supported_cells_f32[i:batch_end])
         batch_query_np = batch_query_cp.get()
-        # Use range search for fixed radius or knn search and filter by distance
-        # Let's use knn search and filter, might be more robust than guessing radius
+        # Use knn search and filter by distance
         D, I = gpu_support_index.search(batch_query_np, k_neighbors)
 
         # Process results (can potentially stay on GPU longer if needed)
@@ -452,16 +467,15 @@ def connect_supported_cells(supported_cells, cell_size, faiss_res=None):
                 # Check if neighbor is valid and within threshold
                 if neighbor_idx >= 0 and neighbor_idx < num_cells and neighbor_idx != cell_idx:
                     if dist_sq <= connection_threshold_sq:
-                        # Check vertical distance constraint if needed (e.g., robot can't step too high)
+                        # Check vertical distance constraint using the max_vertical_step parameter
                         z_diff = abs(supported_cells[cell_idx, 2] - supported_cells[neighbor_idx, 2])
-                        if z_diff < cell_size * 1.1: # Allow stepping up/down one cell height
+                        if z_diff < max_vertical_step:
                             G.add_edge(cell_idx, neighbor_idx, weight=dist_sq**0.5)
                     else:
                         # Since neighbors are sorted by distance, we can stop early for this query point
                         break
                         
         # print(f"Processed connectivity batch {i // batch_size + 1}/{(num_cells + batch_size - 1) // batch_size}")
-
 
     # Find connected components
     components = list(nx.connected_components(G))
@@ -482,50 +496,605 @@ def connect_supported_cells(supported_cells, cell_size, faiss_res=None):
 
     return G
 
-# Apply the improved algorithm
-cell_size = 0.25  # (can adjust based on your robot size)
-supported_cells, G = improved_look_down_algorithm_multi_start(obstacle_points=obstacle_points, 
-    grid_min=min_vals, grid_max=max_vals, cell_size=cell_size, num_z_levels=5, min_clearance=0.1)
-
-robot_width = 0.5  # Width of robot in meters
-robot_length = 0.5  # Length of robot in meters
-robot_height = 0.2  # Height of robot in meters (optional, for clearance check)
-
-def verify_waypoint_support(point, supported_cells, robot_width, robot_length):
+def animate_ray_casting_open3d(obstacle_points, grid_min, grid_max, 
+                             grid_cell_size=0.2,               # Grid resolution
+                             point_influence_radius=None,      # Influence radius for obstacle detection
+                             num_z_levels=3,                   # Number of ray starting heights
+                             min_clearance=0.5,                # Minimum vertical clearance
+                             ray_batch_size=100, 
+                             fps=30):
     """
-    Verify if a point has sufficient support for the robot's dimensions.
+    Animates the ray casting process using Open3D for visualization, matching the parameters
+    used in the improved_look_down_algorithm_multi_start function.
     
     Args:
-        point (np.array): The waypoint to check (x, y, z)
-        supported_cells (np.array): All available supported cells
-        robot_width (float): Width of the robot
-        robot_length (float): Length of the robot
-        
-    Returns:
-        bool: True if the point has sufficient support, False otherwise
+        obstacle_points: The obstacle point cloud (N x 3 numpy array)
+        grid_min: Minimum coordinates of the grid (3-element array/list)
+        grid_max: Maximum coordinates of the grid (3-element array/list)
+        grid_cell_size: Size of each grid cell for ray casting (default: 0.2)
+        point_influence_radius: Radius of influence for obstacle points (default: 0.4 * grid_cell_size)
+        num_z_levels: Number of different Z heights to start rays from (default: 3)
+        min_clearance: Minimum vertical clearance required above a supported cell (default: 0.5)
+        ray_batch_size: Number of rays to visualize per animation frame (default: 100)
+        fps: Target frames per second (default: 30)
     """
-    # Define the robot's footprint boundary (centered at the point)
-    half_width = robot_width / 2
-    half_length = robot_length / 2
+    import open3d as o3d
+    import time
+    import numpy as np
+    import tkinter as tk
+    from tkinter import ttk
     
-    # Find all supported cells within the robot's footprint
-    footprint_mask = (
-        (supported_cells[:, 0] >= point[0] - half_width) & 
-        (supported_cells[:, 0] <= point[0] + half_width) & 
-        (supported_cells[:, 1] >= point[1] - half_length) & 
-        (supported_cells[:, 1] <= point[1] + half_length) &
-        # Allow small height variations (e.g. 10% of cell_size)
-        (abs(supported_cells[:, 2] - point[2]) < cell_size * 0.1)  
+    # Set default values for parameters if not provided
+    if point_influence_radius is None:
+        point_influence_radius = 0.4 * grid_cell_size
+        
+    print(f"Starting Open3D ray casting animation with parameters matching implementation...")
+    print(f"Grid cell size: {grid_cell_size}, Point influence radius: {point_influence_radius}")
+    print(f"Vertical clearance: {min_clearance}, Z levels: {num_z_levels}")
+    
+    # Create Open3D visualization window
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Ray Casting Animation", width=1280, height=720)
+    
+    # --- 1. Add Obstacle Point Cloud ---
+    # Downsample obstacles if needed
+    if len(obstacle_points) > 10000:
+        vis_idx = np.random.choice(len(obstacle_points), 10000, replace=False)
+        vis_obstacles = obstacle_points[vis_idx]
+    else:
+        vis_obstacles = obstacle_points
+    
+    # Create Open3D point cloud for obstacles
+    obstacle_pcd = o3d.geometry.PointCloud()
+    obstacle_pcd.points = o3d.utility.Vector3dVector(vis_obstacles)
+    obstacle_pcd.paint_uniform_color([0.5, 0.5, 0.5])  # Gray color
+    vis.add_geometry(obstacle_pcd)
+    
+    # --- 2. Prepare Grid and Ray Origins ---
+    x_cells = np.arange(grid_min[0] + grid_cell_size / 2, grid_max[0], grid_cell_size)
+    y_cells = np.arange(grid_min[1] + grid_cell_size / 2, grid_max[1], grid_cell_size)
+    # Define multiple Z starting heights - match the algorithm's approach
+    z_starts = np.linspace(grid_max[2] + grid_cell_size, grid_min[2] + min_clearance, num_z_levels)
+    
+    # Create mesh grid for ray origins
+    xx, yy, zz = np.meshgrid(x_cells, y_cells, z_starts)
+    ray_origins_x = xx.flatten()
+    ray_origins_y = yy.flatten()
+    ray_origins_z = zz.flatten()
+    
+    # Combine origins
+    ray_origins = np.column_stack([ray_origins_x, ray_origins_y, ray_origins_z])
+    ray_directions = np.zeros_like(ray_origins)
+    ray_directions[:, 2] = -1.0  # All rays pointing down
+    
+    # --- 3. Setup for FAISS ---
+    obstacle_points_f32 = obstacle_points.astype(np.float32)
+    faiss_res = faiss.StandardGpuResources()
+    index = faiss.IndexFlatL2(3)
+    gpu_index = faiss.index_cpu_to_gpu(faiss_res, 0, index)
+    gpu_index.add(obstacle_points_f32)
+    
+    # GPU copies
+    cp_obstacle_points = cp.asarray(obstacle_points_f32)
+    
+    # --- 4. Define Ray Intersection Kernel ---
+    # Using the same point influence radius as in the main algorithm
+    point_radius_sq = point_influence_radius * point_influence_radius
+    
+    ray_intersection_kernel = cp.ElementwiseKernel(
+        'float32 ox, float32 oy, float32 oz, float32 dx, float32 dy, float32 dz, ' +
+        'float32 grid_min_z, float32 cell_sz, raw float32 obstacles, float32 point_radius_sq',
+        'float32 hit_x, float32 hit_y, float32 hit_z, int32 is_hit',
+        '''
+        const float ray_epsilon = 0.0001f;
+        const float max_dist = oz - grid_min_z + cell_sz; // Max ray distance down to below grid floor
+
+        is_hit = 0;
+        hit_x = ox; // Default to origin X
+        hit_y = oy; // Default to origin Y
+        hit_z = 0.0f; // Default Z
+        float closest_t = max_dist;
+
+        int num_obstacles = obstacles.size() / 3;
+
+        for (int i = 0; i < num_obstacles; i++) {
+            float px = obstacles[i*3 + 0];
+            float py = obstacles[i*3 + 1];
+            float pz = obstacles[i*3 + 2];
+
+            // Simplified check: Distance from point to ray origin projected onto ray path
+            float oc_x = px - ox;
+            float oc_y = py - oy;
+            float oc_z = pz - oz;
+
+            float proj_t = oc_x * dx + oc_y * dy + oc_z * dz; // Ray direction is normalized (length 1 in Z)
+
+            // Check if point is generally 'in front' of the ray origin along its path
+            if (proj_t > ray_epsilon) {
+                // Calculate closest point on ray to obstacle point p
+                float closest_pt_x = ox + proj_t * dx;
+                float closest_pt_y = oy + proj_t * dy;
+                float closest_pt_z = oz + proj_t * dz;
+
+                // Calculate squared distance from obstacle point to the ray line
+                float dist_sq = (px - closest_pt_x)*(px - closest_pt_x) +
+                                (py - closest_pt_y)*(py - closest_pt_y) +
+                                (pz - closest_pt_z)*(pz - closest_pt_z);
+
+                if (dist_sq < point_radius_sq) {
+                    // Ray passes close enough to the point
+                    // Use the projection distance 'proj_t' as the hit distance 't'
+                    if (proj_t < closest_t) {
+                         closest_t = proj_t;
+                         is_hit = 1;
+                         // We only store 't', hit point calculated later if needed
+                    }
+                }
+            }
+        } // End loop through obstacles
+
+        // If hit, calculate precise hit point
+        if (is_hit == 1) {
+             hit_x = ox + closest_t * dx;
+             hit_y = oy + closest_t * dy;
+             hit_z = oz + closest_t * dz;
+
+             // Ensure hit is not below the grid floor (can happen with approximations)
+             if (hit_z < grid_min_z) {
+                 is_hit = 0; // Invalidate hit if it ends up below floor
+             }
+        } else {
+            is_hit = 0; // No hit found
+        }
+        ''',
+        'ray_intersection_kernel'
     )
     
-    footprint_cells = supported_cells[footprint_mask]
+    # --- 5. Add Visualization for Clearance Checks ---
+    # This adds visualization for the clearance check process which is important in the algorithm
     
-    # Check if we have sufficient support (e.g., at least 60% of the footprint area is supported)
-    robot_area = robot_width * robot_length
-    supported_area = len(footprint_cells) * (cell_size ** 2)  # Approximate
-    support_ratio = supported_area / robot_area
+    clearance_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=min_clearance/10)
+    clearance_sphere.paint_uniform_color([0, 0.8, 0.8])  # Cyan
+    clearance_sphere.compute_vertex_normals()
+    vis.add_geometry(clearance_sphere)
     
-    return support_ratio > 0.6  # Require at least 60% support (adjustable threshold)
+    # Store a reference to the sphere for later updates
+    # This is important - create a global dictionary to store the sphere
+    visualization_objects = {'clearance_sphere': clearance_sphere}
+    
+    # --- 6. Setup Visualization Objects ---
+    # Create line set for rays
+    ray_lines = o3d.geometry.LineSet()
+    vis.add_geometry(ray_lines)
+    
+    # Create point clouds for hits and misses
+    hit_points_pcd = o3d.geometry.PointCloud()
+    hit_points_pcd.paint_uniform_color([0, 0.8, 0])  # Green
+    vis.add_geometry(hit_points_pcd)
+    
+    miss_points_pcd = o3d.geometry.PointCloud()
+    miss_points_pcd.paint_uniform_color([0.8, 0, 0])  # Red
+    vis.add_geometry(miss_points_pcd)
+    
+    # Create point cloud for clearance-validated hits
+    valid_hit_points_pcd = o3d.geometry.PointCloud()
+    valid_hit_points_pcd.paint_uniform_color([0, 0, 0.8])  # Blue
+    vis.add_geometry(valid_hit_points_pcd)
+    
+    # Setup render options
+    opt = vis.get_render_option()
+    opt.point_size = 5.0
+    opt.line_width = 2.0
+    opt.background_color = np.array([0.1, 0.1, 0.1])
+    
+    # Setup camera
+    mid_point = (np.array(grid_max) + np.array(grid_min)) / 2
+    max_range = max([grid_max[i] - grid_min[i] for i in range(3)])
+    camera_distance = max_range * 1.5
+    
+    vis_ctr = vis.get_view_control()
+    cam_params = vis_ctr.convert_to_pinhole_camera_parameters()
+    
+    # Position the camera to look at the center of the scene
+    cam_params.extrinsic = np.array([
+        [1, 0, 0, mid_point[0]],
+        [0, -1, 0, mid_point[1]],
+        [0, 0, -1, mid_point[2] + camera_distance],
+        [0, 0, 0, 1]
+    ])
+    vis_ctr.convert_from_pinhole_camera_parameters(cam_params)
+    
+    # Save the initial camera position for reset functionality
+    initial_cam_params = vis_ctr.convert_to_pinhole_camera_parameters()
+    
+    # Create bounding box for better spatial context
+    bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound=np.array(grid_min), max_bound=np.array(grid_max))
+    bbox_lines = o3d.geometry.LineSet.create_from_axis_aligned_bounding_box(bbox)
+    bbox_lines.paint_uniform_color([0.7, 0.7, 0.7])
+    vis.add_geometry(bbox_lines)
+    
+    # --- 7. Process rays in batches ---
+    num_rays = len(ray_origins)
+    num_batches = (num_rays + ray_batch_size - 1) // ray_batch_size
+    print(f"Processing {num_rays} rays in {num_batches} batches...")
+    
+    # Status text - create a sphere at a fixed location to represent progress
+    status_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+    status_sphere.translate(np.array([grid_min[0], grid_min[1], grid_max[2]]))
+    status_sphere.paint_uniform_color([1.0, 1.0, 0.0])  # Yellow
+    vis.add_geometry(status_sphere)
+    
+    # Create tkinter window for the slider
+    slider_window = tk.Tk()
+    slider_window.title("Animation Control")
+    slider_window.geometry("800x200")
+    
+    # Variables to track animation state
+    current_batch = tk.IntVar(value=0)
+    paused = tk.BooleanVar(value=False)
+    auto_play = tk.BooleanVar(value=True)
+    show_clearance = tk.BooleanVar(value=True)
+    total_hits = 0
+    valid_hits = 0
+    ray_data = []  # Will store processed ray data for each batch
+    
+    # Process all batches upfront and save the visualization data
+    print("Pre-processing all ray batches...")
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * ray_batch_size
+        end_idx = min(start_idx + ray_batch_size, num_rays)
+        batch_size = end_idx - start_idx
+        
+        batch_origins = ray_origins[start_idx:end_idx]
+        batch_directions = ray_directions[start_idx:end_idx]
+        
+        # Prepare output arrays for the batch
+        cp_origins = cp.asarray(batch_origins.astype(np.float32))
+        cp_directions = cp.asarray(batch_directions.astype(np.float32))
+        
+        hit_x = cp.zeros(batch_size, dtype=cp.float32)
+        hit_y = cp.zeros(batch_size, dtype=cp.float32)
+        hit_z = cp.zeros(batch_size, dtype=cp.float32)
+        is_hit = cp.zeros(batch_size, dtype=cp.int32)
+        
+        # Execute kernel with the point_radius_sq parameter
+        ray_intersection_kernel(
+            cp_origins[:, 0], cp_origins[:, 1], cp_origins[:, 2],
+            cp_directions[:, 0], cp_directions[:, 1], cp_directions[:, 2],
+            grid_min[2], grid_cell_size, cp_obstacle_points, point_radius_sq,
+            hit_x, hit_y, hit_z, is_hit
+        )
+        
+        # Get results back to CPU
+        hit_points = cp.asnumpy(cp.stack([hit_x, hit_y, hit_z], axis=-1))
+        hit_flags = cp.asnumpy(is_hit).astype(bool)
+        
+        # Count hits in this batch
+        batch_hits = np.sum(hit_flags)
+        total_hits += batch_hits
+        
+        # Check vertical clearance (exactly like in the main algorithm)
+        clearance_validated = np.zeros_like(hit_flags)
+        if batch_hits > 0:
+            hit_indices = np.where(hit_flags)[0]
+            potential_hits = hit_points[hit_indices]
+            
+            # Define clearance check points at the top of the clearance zone
+            check_points = potential_hits.copy()
+            check_points[:, 2] += min_clearance
+            check_points_f32 = check_points.astype(np.float32)
+            
+            # Find the single nearest neighbor using FAISS
+            D, I = gpu_index.search(check_points_f32, 1)
+            
+            # The clearance is ok if the nearest obstacle is farther than min_clearance
+            min_clearance_sq = min_clearance**2
+            clearance_ok = D[:, 0] > min_clearance_sq
+            
+            # Store which points have valid clearance
+            for i, idx in enumerate(hit_indices):
+                if clearance_ok[i]:
+                    clearance_validated[idx] = True
+                    valid_hits += 1
+        
+        # Create data structures for visualization
+        ray_points = []
+        ray_lines_indices = []
+        hit_pts = []
+        miss_pts = []
+        valid_pts = []
+        clearance_check_pts = []
+        
+        # Process each ray
+        line_idx = 0
+        for i in range(batch_size):
+            origin = batch_origins[i]
+            
+            if hit_flags[i]:
+                # Ray hit an obstacle
+                endpoint = hit_points[i]
+                hit_pts.append(endpoint)
+                
+                # If clearance is valid, add to validated points
+                if clearance_validated[i]:
+                    valid_pts.append(endpoint)
+                    # Add a point showing where clearance was checked
+                    check_point = np.array([endpoint[0], endpoint[1], endpoint[2] + min_clearance])
+                    clearance_check_pts.append(check_point)
+            else:
+                # Ray missed all obstacles
+                endpoint = np.array([origin[0], origin[1], grid_min[2]])  # Ground plane
+                miss_pts.append(endpoint)
+            
+            # Add ray points and line
+            ray_points.append(origin)
+            ray_points.append(endpoint)
+            ray_lines_indices.append([line_idx, line_idx + 1])
+            line_idx += 2
+        
+        # Set colors based on hit/miss/clearance
+        line_colors = []
+        for i in range(batch_size):
+            if hit_flags[i]:
+                if clearance_validated[i]:
+                    line_colors.append([0, 0, 0.8])  # Blue for valid hits
+                else:
+                    line_colors.append([0, 0.8, 0])  # Green for hits without clearance
+            else:
+                line_colors.append([0.8, 0, 0])  # Red for misses
+                
+        # Store the batch data
+        ray_data.append({
+            'ray_points': np.array(ray_points),
+            'ray_lines_indices': np.array(ray_lines_indices),
+            'line_colors': np.array(line_colors),
+            'hit_pts': np.array(hit_pts) if hit_pts else np.empty((0, 3)),
+            'miss_pts': np.array(miss_pts) if miss_pts else np.empty((0, 3)),
+            'valid_pts': np.array(valid_pts) if valid_pts else np.empty((0, 3)),
+            'clearance_check_pts': np.array(clearance_check_pts) if clearance_check_pts else np.empty((0, 3)),
+            'progress_x': grid_min[0] + (grid_max[0] - grid_min[0]) * (batch_idx + 1) / num_batches,
+            'batch_hits': batch_hits,
+            'batch_valid_hits': np.sum(clearance_validated),
+            'percentage': (batch_idx + 1) / num_batches * 100
+        })
+        
+        # Print progress
+        if batch_idx % 10 == 0 or batch_idx == num_batches - 1:
+            percentage = (batch_idx + 1) / num_batches * 100
+            print(f"Pre-processing: {percentage:.1f}% - Batch {batch_idx+1}/{num_batches}")
+    
+    print(f"Pre-processing complete. Found {total_hits} hits and {valid_hits} valid (with clearance) hits out of {num_rays} rays.")
+    
+    # Function to update visualization based on slider value
+    def update_visualization(batch_idx):
+        # Ensure batch_idx is an integer
+        batch_idx = int(batch_idx)
+        if batch_idx < 0 or batch_idx >= len(ray_data):
+            return
+
+        # Save current camera parameters before updating anything
+        vis_ctr = vis.get_view_control()
+        current_cam_params = vis_ctr.convert_to_pinhole_camera_parameters()
+
+        batch_data = ray_data[batch_idx]
+
+        # Update ray lines
+        ray_lines.points = o3d.utility.Vector3dVector(batch_data['ray_points'])
+        ray_lines.lines = o3d.utility.Vector2iVector(batch_data['ray_lines_indices'])
+        ray_lines.colors = o3d.utility.Vector3dVector(batch_data['line_colors'])
+
+        # Update hit points
+        hit_points_pcd.points = o3d.utility.Vector3dVector(batch_data['hit_pts'])
+
+        # Update miss points
+        miss_points_pcd.points = o3d.utility.Vector3dVector(batch_data['miss_pts'])
+
+        # Update valid hit points
+        valid_hit_points_pcd.points = o3d.utility.Vector3dVector(batch_data['valid_pts'])
+
+        # Show clearance checks if enabled - with proper sphere reference management
+        if show_clearance.get() and len(batch_data['clearance_check_pts']) > 0:
+            # Remove the old sphere from the visualizer
+            vis.remove_geometry(visualization_objects['clearance_sphere'])
+
+            # Create a new sphere
+            new_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=min_clearance)
+
+            # Position the sphere at the first check point
+            new_sphere.translate(batch_data['clearance_check_pts'][0])
+            new_sphere.paint_uniform_color([0, 0.8, 0.8])  # Cyan
+            new_sphere.compute_vertex_normals()
+
+            # Add the new sphere and update our reference
+            vis.add_geometry(new_sphere)
+            visualization_objects['clearance_sphere'] = new_sphere
+        else:
+            # If we don't want to show the sphere, create a tiny one at origin
+            vis.remove_geometry(visualization_objects['clearance_sphere'])
+            hidden_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.001)
+            hidden_sphere.translate([0, 0, -100])  # Move it far away
+            vis.add_geometry(hidden_sphere)
+            visualization_objects['clearance_sphere'] = hidden_sphere
+
+        # Update status sphere position to show progress
+        current_x = status_sphere.get_center()[0]
+        new_x = batch_data['progress_x']
+        status_sphere.translate(np.array([new_x - current_x, 0, 0]))
+
+        # Update status text
+        status_label.config(text=f"Batch: {batch_idx+1}/{num_batches} - "
+                                f"Progress: {batch_data['percentage']:.1f}% - "
+                                f"Hits: {sum([d['batch_hits'] for d in ray_data[:batch_idx+1]])} - "
+                                f"Valid Hits: {sum([d['batch_valid_hits'] for d in ray_data[:batch_idx+1]])}")
+
+        # Update the visualization
+        vis.update_geometry(ray_lines)
+        vis.update_geometry(hit_points_pcd)
+        vis.update_geometry(miss_points_pcd)
+        vis.update_geometry(valid_hit_points_pcd)
+        vis.update_geometry(visualization_objects['clearance_sphere'])
+        vis.update_geometry(status_sphere)
+
+        # Restore the camera parameters after updating geometry
+        vis_ctr.convert_from_pinhole_camera_parameters(current_cam_params)
+
+        vis.poll_events()
+        vis.update_renderer()
+    
+    # Function called when slider is moved
+    def on_slider_change(event):
+        batch_idx = int(float(slider.get()))
+        current_batch.set(batch_idx)
+        update_visualization(batch_idx)
+    
+    # Functions for playback control
+    def toggle_pause():
+        paused.set(not paused.get())
+        pause_button.config(text="Play" if paused.get() else "Pause")
+    
+    def toggle_auto_play():
+        auto_play.set(not auto_play.get())
+        auto_play_button.config(text="Manual" if auto_play.get() else "Auto Play")
+    
+    def toggle_clearance():
+        show_clearance.set(not show_clearance.get())
+        clearance_button.config(text="Hide Clearance" if show_clearance.get() else "Show Clearance")
+        update_visualization(current_batch.get())
+    
+    def step_forward():
+        new_val = min(current_batch.get() + 1, num_batches - 1)
+        current_batch.set(new_val)
+        slider.set(new_val)
+        update_visualization(new_val)
+    
+    def step_backward():
+        new_val = max(current_batch.get() - 1, 0)
+        current_batch.set(new_val)
+        slider.set(new_val)
+        update_visualization(new_val)
+        
+    # Camera control functions
+    def zoom_in():
+        vis_ctr = vis.get_view_control()
+        zoom_step = 0.1
+        vis_ctr.scale(1.0 - zoom_step)  # Scale < 1 means zoom in
+        vis.poll_events()
+        vis.update_renderer()
+        
+    def zoom_out():
+        vis_ctr = vis.get_view_control()
+        zoom_step = 0.1
+        vis_ctr.scale(1.0 + zoom_step)  # Scale > 1 means zoom out
+        vis.poll_events()
+        vis.update_renderer()
+        
+    def reset_camera():
+        vis_ctr = vis.get_view_control()
+        vis_ctr.convert_from_pinhole_camera_parameters(initial_cam_params)
+        vis.poll_events()
+        vis.update_renderer()
+    
+    # Create slider and buttons
+    slider_frame = ttk.Frame(slider_window)
+    slider_frame.pack(fill=tk.X, padx=10, pady=5)
+    
+    slider = ttk.Scale(
+        slider_frame, 
+        from_=0, 
+        to=num_batches-1, 
+        orient=tk.HORIZONTAL, 
+        length=600,
+        command=on_slider_change
+    )
+    slider.pack(side=tk.TOP, fill=tk.X)
+    
+    # Animation control buttons
+    button_frame = ttk.Frame(slider_window)
+    button_frame.pack(fill=tk.X, padx=10)
+    
+    ttk.Button(button_frame, text="<<", command=lambda: slider.set(0)).pack(side=tk.LEFT, padx=5)
+    ttk.Button(button_frame, text="<", command=step_backward).pack(side=tk.LEFT, padx=5)
+    pause_button = ttk.Button(button_frame, text="Pause", command=toggle_pause)
+    pause_button.pack(side=tk.LEFT, padx=5)
+    ttk.Button(button_frame, text=">", command=step_forward).pack(side=tk.LEFT, padx=5)
+    ttk.Button(button_frame, text=">>", command=lambda: slider.set(num_batches-1)).pack(side=tk.LEFT, padx=5)
+    auto_play_button = ttk.Button(button_frame, text="Manual", command=toggle_auto_play)
+    auto_play_button.pack(side=tk.LEFT, padx=5)
+    
+    # Add clearance toggle button
+    clearance_button = ttk.Button(button_frame, text="Hide Clearance", command=toggle_clearance)
+    clearance_button.pack(side=tk.LEFT, padx=5)
+    
+    # Camera control buttons
+    camera_frame = ttk.Frame(slider_window)
+    camera_frame.pack(fill=tk.X, padx=10, pady=5)
+    
+    ttk.Label(camera_frame, text="Camera:").pack(side=tk.LEFT)
+    ttk.Button(camera_frame, text="Zoom In", command=zoom_in).pack(side=tk.LEFT, padx=5)
+    ttk.Button(camera_frame, text="Zoom Out", command=zoom_out).pack(side=tk.LEFT, padx=5)
+    ttk.Button(camera_frame, text="Reset Camera", command=reset_camera).pack(side=tk.LEFT, padx=5)
+    
+    # Status label
+    status_label = ttk.Label(slider_window, text="Ready to start animation")
+    status_label.pack(fill=tk.X, padx=10, pady=5)
+    
+    # Initial visualization
+    update_visualization(0)
+    
+    # Animation loop
+    def animation_loop():
+        if not paused.get() and auto_play.get():
+            current = current_batch.get()
+            if current < num_batches - 1:
+                next_val = current + 1
+                current_batch.set(next_val)
+                slider.set(next_val)
+                update_visualization(next_val)
+        
+        # Process Open3D events to ensure it stays responsive
+        vis.poll_events()
+        
+        # Speed control - adjust the delay based on preferred playback rate
+        slider_window.after(1000 // fps, animation_loop)
+    
+    # Start animation loop
+    slider_window.after(100, animation_loop)
+    
+    # Run the tkinter main loop
+    try:
+        slider_window.mainloop()
+    except Exception as e:
+        print(f"Error in tkinter mainloop: {e}")
+    finally:
+        # Clean up Open3D window once tkinter exits
+        vis.destroy_window()
+    
+    return True
+
+print("\nStarting Ray Casting Animation with Open3D...")
+animate_ray_casting_open3d(
+    obstacle_points=obstacle_points, 
+    grid_min=min_vals, 
+    grid_max=max_vals, 
+    grid_cell_size=0.25,             # Match the value used in improved_look_down_algorithm
+    point_influence_radius=0.2,      # Match the value used in improved_look_down_algorithm
+    num_z_levels=5,                  # Match the value used in improved_look_down_algorithm
+    min_clearance=0.5,               # Match the value used in improved_look_down_algorithm
+    ray_batch_size=50,               # Animation-specific parameter
+    fps=60                           # Animation-specific parameter
+)
+
+# Apply the improved algorithm
+cell_size = 0.2  # (can adjust based on your robot size)
+supported_cells, G = improved_look_down_algorithm_multi_start(
+    obstacle_points, grid_min=min_vals, grid_max=max_vals,
+    grid_cell_size=0.25,               # Grid resolution for ray casting
+    point_influence_radius=0.2,      # Radius for point detection (default: 0.4 * grid_cell_size) # can influence ramp connection
+    num_z_levels=5,                   # Number of ray starting heights
+    min_clearance=0.5,                # Minimum vertical clearance required
+    vertical_duplicate_threshold=0.25, # Distance for merging cells vertically (default: grid_cell_size)
+    batch_size=10000                  # GPU batch processing size
+)
 
 # Visualize the supported cells
 def visualize_supported_cells_3d():
@@ -606,49 +1175,59 @@ kdtree_time = time.time() - start_time
 
 # Timing: Graph creation of navigable empty space
 start_time = time.time()
-# G = nx.Graph()
-# k_neighbors = 30  # Connect each point to its k nearest neighbors
-# for i, p in enumerate(empty_space_points):
-#     neighbors = tree.query(p, k=k_neighbors+1)[1][1:]  # Skip self
-#     for n in neighbors:
-#         # Check if line between points intersects obstacles
-#         line_points = 10  # Number of check points along the line
-#         t = np.linspace(0, 1, line_points).reshape(-1, 1)
-#         check_points = p.reshape(1, 3) * (1-t) + empty_space_points[n].reshape(1, 3) * t
-        
-#         # Query distances to nearest obstacles
-#         check_distances, _ = tree_obstacles.query(check_points)
-#         if np.all(check_distances > min_obstacle_distance):
-#             # Path is clear, add edge
-#             G.add_edge(i, n, weight=np.linalg.norm(empty_space_points[i] - empty_space_points[n]))
-start_time = time.time()
-# G = nx.Graph()
-k_neighbors = 30
-D_es, I_es = gpu_index_empty.search(empty_space_points_f32, k_neighbors + 1)
-for i in range(len(empty_space_points)):
-    p = empty_space_points[i]
-    neighbors = I_es[i, 1:]  # skip self
-    for n in neighbors:
-        # Only connect points at similar heights (prevent flying)
-        height_diff = abs(p[2] - empty_space_points[n][2])
-        if height_diff > 0.5 * 0.5:  # Allow only small vertical changes
-            continue  # Skip this connection
-            
-        # Check horizontal distance (optional additional constraint)
-        horizontal_dist = np.sqrt((p[0] - empty_space_points[n][0])**2 + 
-                                 (p[1] - empty_space_points[n][1])**2)
-        if horizontal_dist > 0.5 * 2.0:  # Too far horizontally
-            continue
-            
-        # Check small line segments for obstacle clearance
-        line_points = 10
-        t = np.linspace(0, 1, line_points).reshape(-1, 1)
-        check_points = p.reshape(1, 3)*(1-t) + empty_space_points[n].reshape(1, 3)*t
-        check_points_f32 = check_points.astype(np.float32)
 
-        D_chk, I_chk = gpu_index_obstacles.search(check_points_f32, 1)
-        if np.all(np.sqrt(D_chk[:, 0]) > min_obstacle_distance):
-            G.add_edge(i, n, weight=np.linalg.norm(p - empty_space_points[n]))
+k_neighbors = 6
+D_es, I_es = gpu_index_empty.search(empty_space_points_f32, k_neighbors + 1)
+batch_size = 1000
+num_points = len(empty_space_points)
+for batch_start in range(0, num_points, batch_size):
+    batch_end = min(batch_start + batch_size, num_points)
+    batch_indices = range(batch_start, batch_end)
+    
+    # Create all potential connections at once
+    connections = []
+    for i in batch_indices:
+        p = empty_space_points[i]
+        neighbors = I_es[i, 1:k_neighbors+1]  # k nearest neighbors
+        
+        for n in neighbors:
+            # Quick checks for height and horizontal distance
+            height_diff = abs(p[2] - empty_space_points[n][2])
+            if height_diff > 0.25:  # 0.5 * 0.5
+                continue
+                
+            horizontal_dist = np.sqrt((p[0] - empty_space_points[n][0])**2 + 
+                                     (p[1] - empty_space_points[n][1])**2)
+            if horizontal_dist > 0.25:  # 4 * 2.0
+                continue
+                
+            connections.append((i, n))
+    
+    # Batch process all collision checks at once
+    if connections:
+        all_check_points = []
+        for i, n in connections:
+            line_points = np.linspace(0, 1, 10).reshape(-1, 1)
+            points = empty_space_points[i].reshape(1, 3) * (1-line_points) + \
+                    empty_space_points[n].reshape(1, 3) * line_points
+            all_check_points.append(points)
+        
+        # Single FAISS query for all connections
+        all_points = np.vstack(all_check_points).astype(np.float32)
+        D_all, _ = gpu_index_obstacles.search(all_points, 1)
+        
+        # Process results in batches of 10 points per connection
+        point_idx = 0
+        for idx, (i, n) in enumerate(connections):
+            collision_free = True
+            for _ in range(10):  # 10 points per line
+                if np.sqrt(D_all[point_idx][0]) <= min_obstacle_distance:
+                    collision_free = False
+                    break
+                point_idx += 1
+            
+            if collision_free:
+                G.add_edge(i, n, weight=np.linalg.norm(empty_space_points[i] - empty_space_points[n]))
 
 graph_creation_time = time.time() - start_time
 
@@ -657,8 +1236,6 @@ start_point = np.array([0.1, 0.2, 0.3])
 goal_point = np.array([0.8, 0.8, 0.8])
 
 # Find nearest empty space points
-# start_idx = tree.query(start_point)[1]
-# goal_idx = tree.query(goal_point)[1]
 start_idx = gpu_index_empty.search(start_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
 goal_idx = gpu_index_empty.search(goal_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
 
@@ -672,53 +1249,7 @@ def find_path():
     path_start_time = time.time()
     try:
         # Path finding with A*
-        raw_path = nx.astar_path(G, start_idx, goal_idx, weight='weight')
-        
-        # Filter waypoints to ensure sufficient support for the robot
-        valid_waypoints = []
-        for idx in raw_path:
-            point = empty_space_points[idx]
-            if verify_waypoint_support(point, supported_cells, robot_width, robot_length):
-                valid_waypoints.append(idx)
-            else:
-                print(f"Warning: Waypoint at {point} has insufficient support")
-                
-        if len(valid_waypoints) < 2:  # Need at least start and goal
-            print("Not enough valid waypoints with sufficient support")
-            path_calculation_time = time.time() - path_start_time
-            return False
-            
-        # Attempt to find a path through only valid waypoints
-        # This requires rebuilding a subgraph of only valid nodes
-        if len(valid_waypoints) < len(raw_path):
-            print(f"Reduced path from {len(raw_path)} to {len(valid_waypoints)} supported waypoints")
-            subgraph = G.subgraph(valid_waypoints).copy()
-            
-            # Remap node indices to ensure we have a contiguous range
-            mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(valid_waypoints)}
-            subgraph = nx.relabel_nodes(subgraph, mapping)
-            
-            # Find new path through the subgraph
-            start_idx_remapped = mapping.get(start_idx)
-            goal_idx_remapped = mapping.get(goal_idx)
-            
-            if start_idx_remapped is None or goal_idx_remapped is None:
-                print("Start or goal no longer in valid waypoints")
-                path_calculation_time = time.time() - path_start_time
-                return False
-                
-            try:
-                sub_path = nx.astar_path(subgraph, start_idx_remapped, goal_idx_remapped, weight='weight')
-                # Map back to original indices
-                reverse_mapping = {new_idx: old_idx for old_idx, new_idx in mapping.items()}
-                path = [reverse_mapping[idx] for idx in sub_path]
-            except nx.NetworkXNoPath:
-                print("No path found through supported waypoints")
-                path_calculation_time = time.time() - path_start_time
-                return False
-        else:
-            path = raw_path
-            
+        path = nx.astar_path(G, start_idx, goal_idx, weight='weight')
         waypoints = empty_space_points[path]
         path_calculation_time = time.time() - path_start_time
         print(f"Found path with {len(waypoints)} waypoints in {path_calculation_time:.4f} seconds")
@@ -728,215 +1259,389 @@ def find_path():
         print(f"No path found between start and goal (took {path_calculation_time:.4f} seconds)")
         return False
 
-# Create a better structured visualization setup
-def create_visualization():
-    global fig, ax, colorbar, s_start_x, s_start_y, s_start_z, s_goal_x, s_goal_y, s_goal_z
-    global s_robot_width, s_robot_length
-    
-    # Create figure with proper size and layout
-    fig = plt.figure(figsize=(12, 10))
-    
-    # Add adjustable sliders at the bottom of the figure
-    plt.subplots_adjust(bottom=0.4)  # Make more room for sliders
-    
-    # Create the main 3D axes for visualization
-    ax = fig.add_subplot(111, projection='3d')
-    
-    # Create slider axes for start/goal positions
-    ax_start_x = plt.axes([0.2, 0.30, 0.65, 0.02])
-    ax_start_y = plt.axes([0.2, 0.25, 0.65, 0.02])
-    ax_start_z = plt.axes([0.2, 0.20, 0.65, 0.02])
-    ax_goal_x = plt.axes([0.2, 0.15, 0.65, 0.02])
-    ax_goal_y = plt.axes([0.2, 0.10, 0.65, 0.02])
-    ax_goal_z = plt.axes([0.2, 0.05, 0.65, 0.02])
-    
-    # Add robot size sliders
-    ax_robot_width = plt.axes([0.2, 0.35, 0.65, 0.02])
-    ax_robot_length = plt.axes([0.2, 0.40, 0.65, 0.02])
-    
-    # Create the sliders
-    s_start_x = Slider(ax_start_x, 'Start X', min_vals[0], max_vals[0], valinit=start_point[0])
-    s_start_y = Slider(ax_start_y, 'Start Y', min_vals[1], max_vals[1], valinit=start_point[1])
-    s_start_z = Slider(ax_start_z, 'Start Z', min_vals[2], max_vals[2], valinit=start_point[2])
-    s_goal_x = Slider(ax_goal_x, 'Goal X', min_vals[0], max_vals[0], valinit=goal_point[0])
-    s_goal_y = Slider(ax_goal_y, 'Goal Y', min_vals[1], max_vals[1], valinit=goal_point[1])
-    s_goal_z = Slider(ax_goal_z, 'Goal Z', min_vals[2], max_vals[2], valinit=goal_point[2])
-    
-    # Robot dimension sliders
-    s_robot_width = Slider(ax_robot_width, 'Robot Width', 0.1, 1.0, valinit=robot_width)
-    s_robot_length = Slider(ax_robot_length, 'Robot Length', 0.1, 1.0, valinit=robot_length)
-    
-    # Connect the update function to the sliders
-    s_start_x.on_changed(update)
-    s_start_y.on_changed(update)
-    s_start_z.on_changed(update)
-    s_goal_x.on_changed(update)
-    s_goal_y.on_changed(update)
-    s_goal_z.on_changed(update)
-    s_robot_width.on_changed(update)
-    s_robot_length.on_changed(update)
-    
-    # Initialize colorbar as None
-    colorbar = None
-    
-    return fig, ax
-
-# Function to update the plot
-def update_plot():
-    global colorbar
-    plot_start_time = time.time()
-    
-    # First, remove the existing colorbar if it exists and is still valid
-    if colorbar is not None and getattr(colorbar, 'ax', None) is not None:
-        colorbar.remove()
-        colorbar = None
-
-    # Clear the axis
-    ax.clear()
-    
-    # Now create the scatter plot and a new colorbar
-    scatter = ax.scatter(
-        obstacle_points_vis[:, 0], obstacle_points_vis[:, 1], obstacle_points_vis[:, 2],
-        c=obstacle_points_vis[:, 2], cmap='viridis', alpha=0.6, s=10
-    )
-    
-    colorbar = plt.colorbar(scatter, ax=ax, pad=0.1, fraction=0.046, aspect=20)
-    colorbar.set_label('Height (Z)')
-    
-    # Plot the start, goal, and navigation points
-    ax.scatter(start_point[0], start_point[1], start_point[2], c='green', s=100, label='Start')
-    ax.scatter(goal_point[0], goal_point[1], goal_point[2], c='blue', s=100, label='Goal')
-    ax.scatter(
-        empty_space_points[start_idx][0], empty_space_points[start_idx][1], empty_space_points[start_idx][2],
-        c='limegreen', s=80
-    )
-    ax.scatter(
-        empty_space_points[goal_idx][0], empty_space_points[goal_idx][1], empty_space_points[goal_idx][2],
-        c='royalblue', s=80
-    )
-    
-    if path_found:
-        ax.scatter(waypoints[:, 0], waypoints[:, 1], waypoints[:, 2], c='red', s=30, label='Waypoints')
-        ax.plot(waypoints[:, 0], waypoints[:, 1], waypoints[:, 2], 'r-', linewidth=2)
-        
-        # Draw robot footprint at each waypoint (just a few for visibility)
-        show_footprints = min(len(waypoints), 5)  # Show at most 5 footprints
-        step = max(1, len(waypoints) // show_footprints)
-        
-        for i in range(0, len(waypoints), step):
-            wp = waypoints[i]
-            half_width = robot_width / 2
-            half_length = robot_length / 2
-            
-            # Create rectangle vertices for the robot footprint
-            rect_points = [
-                [wp[0] - half_width, wp[1] - half_length, wp[2]],
-                [wp[0] + half_width, wp[1] - half_length, wp[2]],
-                [wp[0] + half_width, wp[1] + half_length, wp[2]],
-                [wp[0] - half_width, wp[1] + half_length, wp[2]],
-                [wp[0] - half_width, wp[1] - half_length, wp[2]]  # Close the loop
-            ]
-            rect_points = np.array(rect_points)
-            
-            # Plot the footprint
-            ax.plot(rect_points[:, 0], rect_points[:, 1], rect_points[:, 2], 'orange', linewidth=1.5)
-    
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    ax.set_title('3D Navigation with Robot-Sized Footprints')
-    ax.legend()
-    
-    plot_time = time.time() - plot_start_time
-    print(f"Plot update took {plot_time:.4f} seconds")
-    fig.canvas.draw_idle()
-
-# Update function for sliders
-def update(_):
-    global start_point, goal_point, start_idx, goal_idx, path_found, robot_width, robot_length
-    
-    # Update start and goal from sliders
-    start_point = np.array([s_start_x.val, s_start_y.val, s_start_z.val])
-    goal_point = np.array([s_goal_x.val, s_goal_y.val, s_goal_z.val])
-    
-    # Update robot dimensions
-    robot_width = s_robot_width.val
-    robot_length = s_robot_length.val
-    
-    # Find nearest navigable points
-    start_idx = gpu_index_empty.search(start_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
-    goal_idx = gpu_index_empty.search(goal_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
-    
-    # Recompute path
-    path_found = find_path()
-    
-    # Update plot
-    update_plot()
-
 # Initialize path finding
 path_found = find_path()
 
-# Create the visualization
-fig, ax = create_visualization()
+# Open3D visualization instead of matplotlib
+import open3d as o3d
+import tkinter as tk
+from tkinter import ttk
 
-# Initial plot
-update_plot()
+class Open3DVisualizer:
+    def __init__(self):
+        self.vis = o3d.visualization.VisualizerWithKeyCallback()
+        self.vis.create_window("3D Navigation Visualization", width=1280, height=720)
+        
+        # Configure rendering options
+        render_options = self.vis.get_render_option()
+        render_options.background_color = np.array([0.1, 0.1, 0.1])
+        render_options.point_size = 3.0
+        render_options.line_width = 2.0
+        
+        # Create UI window for sliders
+        self.ui_window = tk.Tk()
+        self.ui_window.title("Navigation Controls")
+        self.ui_window.geometry("600x350")
+        
+        # Create objects dictionary to manage visualization objects
+        self.objects = {}
+        
+        # Initialize the geometric objects
+        self.init_geometries()
+        
+        # Setup the UI controls
+        self.setup_ui()
+    
+    def init_geometries(self):
+        # Point cloud for obstacles
+        self.objects["obstacles"] = o3d.geometry.PointCloud()
+        self.objects["obstacles"].points = o3d.utility.Vector3dVector(obstacle_points_vis)
+        # Use height-based coloring
+        colors = np.zeros((len(obstacle_points_vis), 3))
+        normalized_height = (obstacle_points_vis[:, 2] - min_vals[2]) / (max_vals[2] - min_vals[2])
+        viridis = plt.cm.viridis
+        for i, h in enumerate(normalized_height):
+            colors[i] = viridis(h)[:3]  # Get RGB components only
+        self.objects["obstacles"].colors = o3d.utility.Vector3dVector(colors)
+        self.vis.add_geometry(self.objects["obstacles"])
+        
+        # Empty space points
+        self.objects["empty_space"] = o3d.geometry.PointCloud()
+        self.objects["empty_space"].points = o3d.utility.Vector3dVector(empty_space_points)
+        self.objects["empty_space"].paint_uniform_color([0.4, 0.4, 0.9])  # Light blue
+        self.vis.add_geometry(self.objects["empty_space"])
+        
+        # Start point sphere
+        self.objects["start"] = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+        self.objects["start"].translate(start_point)
+        self.objects["start"].paint_uniform_color([0, 1, 0])  # Green
+        self.objects["start"].compute_vertex_normals()
+        self.vis.add_geometry(self.objects["start"])
+        
+        # Goal point sphere
+        self.objects["goal"] = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+        self.objects["goal"].translate(goal_point)
+        self.objects["goal"].paint_uniform_color([0, 0, 1])  # Blue
+        self.objects["goal"].compute_vertex_normals()
+        self.vis.add_geometry(self.objects["goal"])
+        
+        # Start nearest point sphere
+        self.objects["start_nearest"] = o3d.geometry.TriangleMesh.create_sphere(radius=0.03)
+        self.objects["start_nearest"].translate(empty_space_points[start_idx])
+        self.objects["start_nearest"].paint_uniform_color([0.5, 1, 0.5])  # Light green
+        self.objects["start_nearest"].compute_vertex_normals()
+        self.vis.add_geometry(self.objects["start_nearest"])
+        
+        # Goal nearest point sphere
+        self.objects["goal_nearest"] = o3d.geometry.TriangleMesh.create_sphere(radius=0.03)
+        self.objects["goal_nearest"].translate(empty_space_points[goal_idx])
+        self.objects["goal_nearest"].paint_uniform_color([0.5, 0.5, 1])  # Light blue
+        self.objects["goal_nearest"].compute_vertex_normals()
+        self.vis.add_geometry(self.objects["goal_nearest"])
+        
+        # Path line set (initially empty)
+        self.objects["path"] = o3d.geometry.LineSet()
+        if path_found and len(waypoints) > 1:
+            self.update_path_visualization()
+        self.vis.add_geometry(self.objects["path"])
+        
+        # Bounding box for context
+        bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound=min_vals, max_bound=max_vals)
+        self.objects["bbox"] = o3d.geometry.LineSet.create_from_axis_aligned_bounding_box(bbox)
+        self.objects["bbox"].paint_uniform_color([0.7, 0.7, 0.7])
+        self.vis.add_geometry(self.objects["bbox"])
+    
+    def update_path_visualization(self):
+        if not path_found or len(waypoints) <= 1:
+            self.objects["path"].points = o3d.utility.Vector3dVector([])
+            self.objects["path"].lines = o3d.utility.Vector2iVector([])
+            self.objects["path"].colors = o3d.utility.Vector3dVector([])
+            return
+            
+        # Create line set for the path
+        points = o3d.utility.Vector3dVector(waypoints)
+        lines = []
+        for i in range(len(waypoints) - 1):
+            lines.append([i, i + 1])
+        line_colors = [[1, 0, 0] for _ in range(len(lines))]  # Red lines
+        
+        self.objects["path"].points = points
+        self.objects["path"].lines = o3d.utility.Vector2iVector(lines)
+        self.objects["path"].colors = o3d.utility.Vector3dVector(line_colors)
+    
+    def setup_ui(self):
+        # Create frames for sliders
+        start_frame = ttk.LabelFrame(self.ui_window, text="Start Position")
+        start_frame.pack(fill="x", padx=10, pady=5)
+        
+        goal_frame = ttk.LabelFrame(self.ui_window, text="Goal Position")
+        goal_frame.pack(fill="x", padx=10, pady=5)
+        
+        button_frame = ttk.Frame(self.ui_window)
+        button_frame.pack(fill="x", padx=10, pady=10)
+        
+        # Status frame
+        status_frame = ttk.LabelFrame(self.ui_window, text="Status")
+        status_frame.pack(fill="x", padx=10, pady=5)
+        
+        # Create sliders for start position
+        self.start_x = self.create_slider(start_frame, "X:", min_vals[0], max_vals[0], start_point[0])
+        self.start_y = self.create_slider(start_frame, "Y:", min_vals[1], max_vals[1], start_point[1])
+        self.start_z = self.create_slider(start_frame, "Z:", min_vals[2], max_vals[2], start_point[2])
+        
+        # Create sliders for goal position
+        self.goal_x = self.create_slider(goal_frame, "X:", min_vals[0], max_vals[0], goal_point[0])
+        self.goal_y = self.create_slider(goal_frame, "Y:", min_vals[1], max_vals[1], goal_point[1])
+        self.goal_z = self.create_slider(goal_frame, "Z:", min_vals[2], max_vals[2], goal_point[2])
+        
+        # Create update button
+        self.update_button = ttk.Button(button_frame, text="Update Path", command=self.update_positions)
+        self.update_button.pack(side=tk.LEFT, padx=5)
+        
+        # Create graph visualization button
+        self.graph_button = ttk.Button(button_frame, text="Show Graph", command=self.show_graph_view)
+        self.graph_button.pack(side=tk.LEFT, padx=5)
+        
+        # Create reset view button
+        self.reset_button = ttk.Button(button_frame, text="Reset View", command=self.reset_view)
+        self.reset_button.pack(side=tk.LEFT, padx=5)
+        
+        # Create hide/show obstacle points button
+        self.toggle_obstacles_button = ttk.Button(button_frame, text="Toggle Obstacles", command=self.toggle_obstacles)
+        self.toggle_obstacles_button.pack(side=tk.LEFT, padx=5)
+        
+        # Create status label
+        self.status_var = tk.StringVar(value="Ready")
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_var)
+        self.status_label.pack(fill="x", padx=5, pady=5)
+        
+        # Show initial status
+        self.update_status()
+    
+    def create_slider(self, parent, label_text, min_val, max_val, initial_val):
+        frame = ttk.Frame(parent)
+        frame.pack(fill="x", padx=5, pady=2)
+        
+        label = ttk.Label(frame, text=label_text, width=3)
+        label.pack(side=tk.LEFT)
+        
+        slider = ttk.Scale(frame, from_=min_val, to=max_val, orient=tk.HORIZONTAL)
+        slider.set(initial_val)
+        slider.pack(side=tk.LEFT, fill="x", expand=True)
+        
+        value_var = tk.StringVar(value=f"{initial_val:.2f}")
+        value_label = ttk.Label(frame, textvariable=value_var, width=6)
+        value_label.pack(side=tk.LEFT)
+        
+        # Update value label when slider changes
+        def on_change(event):
+            value_var.set(f"{slider.get():.2f}")
+        
+        slider.bind("<Motion>", on_change)
+        slider.bind("<ButtonRelease-1>", on_change)
+        
+        return slider
+    
+    def update_positions(self):
+        global start_point, goal_point, start_idx, goal_idx, path_found
+        
+        # Get current values from sliders
+        start_point = np.array([
+            self.start_x.get(),
+            self.start_y.get(),
+            self.start_z.get()
+        ])
+        
+        goal_point = np.array([
+            self.goal_x.get(),
+            self.goal_y.get(),
+            self.goal_z.get()
+        ])
+        
+        # Update sphere positions
+        self.objects["start"].translate(start_point - np.asarray(self.objects["start"].get_center()))
+        self.objects["goal"].translate(goal_point - np.asarray(self.objects["goal"].get_center()))
+        
+        # Find nearest navigable points
+        start_idx = gpu_index_empty.search(start_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
+        goal_idx = gpu_index_empty.search(goal_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
+        
+        # Update nearest points
+        self.objects["start_nearest"].translate(
+            empty_space_points[start_idx] - np.asarray(self.objects["start_nearest"].get_center())
+        )
+        self.objects["goal_nearest"].translate(
+            empty_space_points[goal_idx] - np.asarray(self.objects["goal_nearest"].get_center())
+        )
+        
+        # Recompute path
+        path_found = find_path()
+        
+        # Update path visualization
+        self.update_path_visualization()
+        
+        # Update status
+        self.update_status()
+        
+        # Update all geometries in the visualizer
+        self.update_geometries()
+    
+    def update_status(self):
+        if path_found:
+            self.status_var.set(f"Found path with {len(waypoints)} waypoints in {path_calculation_time:.4f} seconds")
+        else:
+            self.status_var.set(f"No path found between start and goal (took {path_calculation_time:.4f} seconds)")
+    
+    def update_geometries(self):
+        self.vis.update_geometry(self.objects["start"])
+        self.vis.update_geometry(self.objects["goal"])
+        self.vis.update_geometry(self.objects["start_nearest"])
+        self.vis.update_geometry(self.objects["goal_nearest"])
+        self.vis.update_geometry(self.objects["path"])
+        self.vis.poll_events()
+        self.vis.update_renderer()
+    
+    def toggle_obstacles(self):
+        """Toggle visibility of obstacle point cloud"""
+        if "obstacles" in self.objects:
+            # Instead of checking if the geometry is in the visualizer,
+            # we'll keep track of visibility state
+            if not hasattr(self, '_obstacles_visible'):
+                self._obstacles_visible = True
+                
+            if self._obstacles_visible:
+                # Currently visible, so remove it
+                self.vis.remove_geometry(self.objects["obstacles"])
+                self._obstacles_visible = False
+            else:
+                # Currently hidden, so add it back
+                self.vis.add_geometry(self.objects["obstacles"])
+                self._obstacles_visible = True
+                
+            self.vis.poll_events()
+            self.vis.update_renderer()
+    
+    def show_graph_view(self):
+        """Show navigation graph in a new window"""
+        # Create a new visualizer for graph view with a unique name
+        graph_vis = o3d.visualization.Visualizer()
+        graph_vis.create_window("Navigation Graph View", width=1280, height=720)
 
-# Function to visualize the full graph (optional)
-def visualize_graph():
-    fig_graph = plt.figure(figsize=(10, 8))
-    ax_graph = fig_graph.add_subplot(111, projection='3d')
-    
-    # Plot obstacles with height-based coloring
-    scatter = ax_graph.scatter(obstacle_points_vis[:, 0], obstacle_points_vis[:, 1], obstacle_points_vis[:, 2], 
-                   c=obstacle_points_vis[:, 2], cmap='viridis', alpha=0.6, s=10)
-    
-    # Add colorbar
-    cbar = plt.colorbar(scatter, ax=ax_graph, pad=0.1)
-    cbar.set_label('Height (Z)')
-    
-    # Plot navigation points
-    ax_graph.scatter(empty_space_points[:, 0], empty_space_points[:, 1], empty_space_points[:, 2], 
-                   c='lightblue', alpha=0.3, s=5, label='Navigation Points')
-    
-    # Plot edges (use a subset if there are too many)
-    edge_count = 0
-    max_edges = 1000  # Adjust based on your computer's capability
-    edge_sample = list(G.edges())
-    if len(edge_sample) > max_edges:
-        edge_sample = np.random.choice(edge_sample, max_edges, replace=False)
-    
-    for u, v in edge_sample:
-        ax_graph.plot([empty_space_points[u][0], empty_space_points[v][0]], 
-                    [empty_space_points[u][1], empty_space_points[v][1]], 
-                    [empty_space_points[u][2], empty_space_points[v][2]], 
-                    'b-', alpha=0.1, linewidth=0.5)
-        edge_count += 1
-    
-    # Plot path
-    if path_found:
-        for i in range(len(path)-1):
-            u, v = path[i], path[i+1]
-            ax_graph.plot([empty_space_points[u][0], empty_space_points[v][0]], 
-                        [empty_space_points[u][1], empty_space_points[v][1]], 
-                        [empty_space_points[u][2], empty_space_points[v][2]], 
-                        'r-', linewidth=2.0, label='Path' if i == 0 else "")
-    
-    # Plot start and goal
-    ax_graph.scatter(start_point[0], start_point[1], start_point[2], 
-                   c='green', s=100, label='Start')
-    ax_graph.scatter(goal_point[0], goal_point[1], goal_point[2], 
-                   c='blue', s=100, label='Goal')
-    
-    ax_graph.set_xlabel('X')
-    ax_graph.set_ylabel('Y')
-    ax_graph.set_zlabel('Z')
-    ax_graph.set_title(f'Navigation Graph (showing {edge_count} of {len(G.edges())} edges)')
-    ax_graph.legend()
-    
-    return fig_graph
+        # Add obstacles
+        obstacles_pc = o3d.geometry.PointCloud()
+        obstacles_pc.points = o3d.utility.Vector3dVector(obstacle_points_vis)
+        colors = np.zeros((len(obstacle_points_vis), 3))
+        normalized_height = (obstacle_points_vis[:, 2] - min_vals[2]) / (max_vals[2] - min_vals[2])
+        viridis = plt.cm.viridis
+        for i, h in enumerate(normalized_height):
+            colors[i] = viridis(h)[:3]
+        obstacles_pc.colors = o3d.utility.Vector3dVector(colors)
+        graph_vis.add_geometry(obstacles_pc)
 
-# Uncomment to show the full graph visualization
-# graph_fig = visualize_graph()
+        # Add empty space points
+        empty_space_pc = o3d.geometry.PointCloud()
+        empty_space_pc.points = o3d.utility.Vector3dVector(empty_space_points)
+        empty_space_pc.paint_uniform_color([0.4, 0.4, 0.9])
+        graph_vis.add_geometry(empty_space_pc)
 
-plt.show()
+        # Add graph edges (limited to avoid too many edges)
+        edge_count = 0
+        max_edges = 1000  # Maximum number of edges to display
+
+        edge_points = []
+        edge_indices = []
+
+        # Safely get edges from the graph
+        try:
+            edge_sample = list(G.edges())
+            if len(edge_sample) > max_edges:
+                # Randomly sample edges if there are too many
+                np.random.seed(42)  # For reproducibility
+                edge_sample = np.random.choice(len(edge_sample), max_edges, replace=False)
+                edge_sample = [edge_sample[i] for i in edge_sample]
+
+            for i, (u, v) in enumerate(edge_sample):
+                if u < len(empty_space_points) and v < len(empty_space_points):
+                    edge_points.append(empty_space_points[u])
+                    edge_points.append(empty_space_points[v])
+                    edge_indices.append([2*i, 2*i+1])
+                    edge_count += 1
+        except Exception as e:
+            print(f"Error processing graph edges: {e}")
+            # Continue with what we have
+
+        if edge_points:
+            edge_lines = o3d.geometry.LineSet()
+            edge_lines.points = o3d.utility.Vector3dVector(edge_points)
+            edge_lines.lines = o3d.utility.Vector2iVector(edge_indices)
+            edge_lines.paint_uniform_color([0.7, 0.7, 0.7])  # Gray
+            graph_vis.add_geometry(edge_lines)
+
+        # Add path if found
+        if path_found and len(waypoints) > 1:
+            path_line_set = o3d.geometry.LineSet()
+            path_points = waypoints
+            path_lines = [[i, i+1] for i in range(len(path_points)-1)]
+            path_line_set.points = o3d.utility.Vector3dVector(path_points)
+            path_line_set.lines = o3d.utility.Vector2iVector(path_lines)
+            path_line_set.paint_uniform_color([1, 0, 0])  # Red
+            graph_vis.add_geometry(path_line_set)
+
+        # Add start and goal markers
+        start_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+        start_sphere.translate(start_point)
+        start_sphere.paint_uniform_color([0, 1, 0])
+        start_sphere.compute_vertex_normals()
+        graph_vis.add_geometry(start_sphere)
+
+        goal_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+        goal_sphere.translate(goal_point)
+        goal_sphere.paint_uniform_color([0, 0, 1])
+        goal_sphere.compute_vertex_normals()
+        graph_vis.add_geometry(goal_sphere)
+
+        # Set render options
+        render_opt = graph_vis.get_render_option()
+        render_opt.background_color = np.array([0.1, 0.1, 0.1])
+        render_opt.point_size = 3.0
+        render_opt.line_width = 2.0
+
+        # Set title in status bar instead of recreating the window
+        graph_vis.get_window_control().set_title(
+            f"Navigation Graph (showing {edge_count} of {len(G.edges() if hasattr(G, 'edges') else [])} edges)"
+        )
+
+        # Set a default camera position
+        graph_view_control = graph_vis.get_view_control()
+        graph_view_control.set_zoom(0.8)
+
+        # Run the visualization loop
+        graph_vis.run()
+        graph_vis.destroy_window()
+    
+    def reset_view(self):
+        # Reset the camera view
+        self.vis.reset_view_point(True)
+        self.vis.poll_events()
+        self.vis.update_renderer()
+    
+    def run(self):
+        # Setup callback for closing the UI window properly
+        def on_closing():
+            self.ui_window.destroy()
+            self.vis.destroy_window()
+        
+        self.ui_window.protocol("WM_DELETE_WINDOW", on_closing)
+        
+        # Start UI update loop
+        def update_loop():
+            self.vis.poll_events()
+            self.vis.update_renderer()
+            self.ui_window.after(33, update_loop)  # 30 FPS
+        
+        update_loop()
+        self.ui_window.mainloop()
+
+# Create and run the Open3D visualizer
+visualizer = Open3DVisualizer()
+visualizer.run()
