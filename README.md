@@ -91,7 +91,12 @@ $$
 
 ### 2. Ray‑Casting Kernel
 
-- For each ray origin \(\mathbf{o}\) and direction \(\mathbf{d}=(0,0,-1)\), we approximate intersection by checking:
+- For each ray origin 
+$$
+\(\mathbf{o}\) and direction \(\mathbf{d}=(0,0,-1)\)
+$$
+
+we approximate intersection by checking:
 
 $$
 \mathrm{proj}_t = (\mathbf{p}-\mathbf{o})\cdot\mathbf{d},\quad
@@ -102,7 +107,13 @@ $$
 
 ### 3. Clearance Check
 
-- For each hit point \(\mathbf{h}\), verify no obstacle lies within a sphere of radius \(r\) above:
+- For each hit point 
+
+$$
+\(\mathbf{h}\)
+$$
+
+verify no obstacle lies within a sphere of radius \(r\) above:
 
 $$
 \|\mathbf{q} - (\mathbf{h} + r\,\mathbf{e}_z)\| > r\;\;\forall\,\mathbf{q}\in\text{obstacles}
