@@ -508,6 +508,275 @@ supported_cells, G = improved_look_down_algorithm_multi_start(
     batch_size=10000                  # GPU batch processing size
 )
 
+def detect_edge_cells(
+    supported_cells, 
+    G, 
+    obstacle_points, 
+    gpu_index_obstacles,
+    min_clearance=0.5,
+    edge_neighbor_threshold=4,
+    horizontal_distance_threshold=0.25,
+    vertical_dropoff_threshold=0.4,
+    overhang_detection_distance=0.3
+):
+    """
+    Detects cells that are at the edges of overhangs, cliffs, or ramps.
+    
+    Args:
+        supported_cells: Array of supported cell points (Nx3)
+        G: NetworkX graph of cell connectivity
+        obstacle_points: Point cloud of obstacles
+        gpu_index_obstacles: FAISS GPU index for obstacle points
+        min_clearance: Minimum clearance height above cells (default: 0.5)
+        edge_neighbor_threshold: Minimum number of neighbors to not be considered an edge (default: 4)
+        horizontal_distance_threshold: Maximum horizontal distance to consider for edge detection (default: 0.25)
+        vertical_dropoff_threshold: Minimum height difference to consider a dropoff edge (default: 0.4)
+        overhang_detection_distance: Distance to check for overhang detection (default: 0.3)
+        
+    Returns:
+        edge_mask: Boolean mask of same length as supported_cells indicating edge cells
+        edge_types: Dictionary mapping cell indices to edge type ('cliff', 'overhang', 'ramp')
+    """
+    print(f"Detecting edge cells from {len(supported_cells)} supported cells...")
+    
+    # Initialize the edge detection mask and types
+    edge_mask = np.zeros(len(supported_cells), dtype=bool)
+    edge_types = {}
+    
+    # 1. Connectivity-based edge detection
+    # Cells with fewer connected neighbors than threshold are potential edges
+    connectivity_edges = []
+    for i in range(len(supported_cells)):
+        neighbors = list(G.neighbors(i))
+        if len(neighbors) < edge_neighbor_threshold:
+            connectivity_edges.append(i)
+            edge_mask[i] = True
+            edge_types[i] = "potential_edge"  # Will refine this later
+    
+    print(f"Found {len(connectivity_edges)} potential edge cells based on connectivity")
+    
+    # 2. Dropoff detection - check for sudden height changes
+    # For each potential edge cell, examine the surrounding region
+    # to detect significant height differences
+    dropoff_edges = []
+    
+    # Convert to float32 for FAISS
+    supported_cells_f32 = supported_cells.astype(np.float32)
+    
+    # Create a FAISS index for the supported cells
+    res = faiss.StandardGpuResources()
+    cell_index = faiss.IndexFlatL2(3)
+    gpu_cell_index = faiss.index_cpu_to_gpu(res, 0, cell_index)
+    gpu_cell_index.add(supported_cells_f32)
+    
+    # Search radius is the horizontal threshold
+    search_radius = horizontal_distance_threshold
+    k_neighbors = 15  # Number of neighbors to examine
+    
+    # Batch processing for efficiency
+    batch_size = 500
+    for start_idx in range(0, len(connectivity_edges), batch_size):
+        end_idx = min(start_idx + batch_size, len(connectivity_edges))
+        batch_indices = connectivity_edges[start_idx:end_idx]
+        
+        query_points = supported_cells_f32[batch_indices]
+        D, I = gpu_cell_index.search(query_points, k_neighbors)
+        
+        for i, cell_idx in enumerate(batch_indices):
+            neighbors = I[i]
+            is_dropoff = False
+            cell_height = supported_cells[cell_idx, 2]
+            
+            # Look for significant height differences in neighbors
+            for n_idx in neighbors:
+                if n_idx < 0 or n_idx >= len(supported_cells) or n_idx == cell_idx:
+                    continue
+                    
+                neighbor = supported_cells[n_idx]
+                
+                # First check if they're close horizontally
+                horiz_dist = np.sqrt((supported_cells[cell_idx, 0] - neighbor[0])**2 + 
+                                   (supported_cells[cell_idx, 1] - neighbor[1])**2)
+                
+                if horiz_dist <= search_radius:
+                    height_diff = abs(cell_height - neighbor[2])
+                    if height_diff > vertical_dropoff_threshold:
+                        is_dropoff = True
+                        break
+            
+            # Identify if this is a dropoff edge
+            if is_dropoff:
+                dropoff_edges.append(cell_idx)
+                edge_types[cell_idx] = "cliff"
+    
+    print(f"Found {len(dropoff_edges)} cliff/dropoff edges")
+    
+    # 3. Overhang detection - cast rays horizontally from edge cells
+    overhang_edges = []
+    
+    # Cast rays in 8 directions around each potential edge
+    directions = [
+        [1, 0, 0], [-1, 0, 0],  # +/- X
+        [0, 1, 0], [0, -1, 0],  # +/- Y
+        [1, 1, 0], [1, -1, 0],  # Diagonals
+        [-1, 1, 0], [-1, -1, 0]
+    ]
+    # Normalize direction vectors
+    directions = [d/np.linalg.norm(d) for d in directions]
+    
+    # For each potential edge cell
+    for cell_idx in connectivity_edges:
+        if cell_idx in dropoff_edges:
+            continue  # Already classified
+            
+        cell = supported_cells[cell_idx]
+        is_overhang = False
+        
+        # Cast rays in multiple directions
+        for direction in directions:
+            # Create ray test points
+            test_points = np.array([
+                cell + direction * d for d in np.linspace(0.05, overhang_detection_distance, 5)
+            ])
+            
+            # Check if ray points are not supported
+            test_points_f32 = test_points.astype(np.float32)
+            D, I = gpu_index_obstacles.search(test_points_f32, 1)
+            distances = np.sqrt(D[:, 0])
+            
+            # Calculate a simplified occupancy check:
+            # 1. If point is far from obstacles - means it's in free space (potential overhang)
+            # 2. If all points are close to obstacles - not an overhang edge
+            if np.all(distances > min_clearance/2):
+                # No obstacle detected along ray - potential overhang
+                
+                # Now check if there are no supported cells in this direction
+                D_cells, I_cells = gpu_cell_index.search(test_points_f32, 1)
+                nearest_cell_dists = np.sqrt(D_cells[:, 0])
+                
+                # If nearest cells are far away, this is empty space beyond the edge
+                if np.any(nearest_cell_dists > horizontal_distance_threshold):
+                    is_overhang = True
+                    edge_types[cell_idx] = "overhang"
+                    break
+        
+        if is_overhang:
+            overhang_edges.append(cell_idx)
+    
+    print(f"Found {len(overhang_edges)} overhang edges")
+    
+    # 4. Ramp detection
+    # Find cells that are on edges but have progressive height changes
+    ramp_edges = []
+    for cell_idx in connectivity_edges:
+        if cell_idx in dropoff_edges or cell_idx in overhang_edges:
+            continue  # Already classified
+            
+        # Get neighbors and check if they form a gradient in height
+        neighbors = list(G.neighbors(cell_idx))
+        
+        # Skip isolated points
+        if not neighbors:
+            continue
+            
+        # Get heights of cell and neighbors
+        cell_height = supported_cells[cell_idx, 2]
+        neighbor_heights = [supported_cells[n, 2] for n in neighbors]
+        
+        # Calculate height differences
+        height_diffs = [abs(h - cell_height) for h in neighbor_heights]
+        
+        # Check if height differences form a gradient (ramp characteristic)
+        if max(height_diffs) > 0.05 and max(height_diffs) < vertical_dropoff_threshold:
+            # Calculate slope by looking at XY distance vs Z change
+            max_slope = 0
+            for n_idx in neighbors:
+                neighbor = supported_cells[n_idx]
+                horiz_dist = np.sqrt((supported_cells[cell_idx, 0] - neighbor[0])**2 + 
+                                    (supported_cells[cell_idx, 1] - neighbor[1])**2)
+                if horiz_dist > 0:  # Avoid division by zero
+                    slope = abs(cell_height - neighbor[2]) / horiz_dist
+                    max_slope = max(max_slope, slope)
+            
+            # If slope is significant but not extreme, it's likely a ramp edge
+            if 0.1 < max_slope < 0.6:  # Typical ramp slopes
+                ramp_edges.append(cell_idx)
+                edge_types[cell_idx] = "ramp"
+    
+    print(f"Found {len(ramp_edges)} ramp edges")
+    
+    # Combine all edge types
+    all_edges = list(set(dropoff_edges + overhang_edges + ramp_edges))
+    edge_mask = np.zeros(len(supported_cells), dtype=bool)
+    edge_mask[all_edges] = True
+    
+    print(f"Found {len(all_edges)} total edge cells")
+    return edge_mask, edge_types
+
+def visualize_edge_cells(supported_cells, edge_mask, edge_types, obstacle_points_vis):
+    """Visualize the detected edge cells with distinct colors based on edge type"""
+    # Create a new figure
+    fig = plt.figure(figsize=(14, 12))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Plot downsampled obstacles
+    ax.scatter(obstacle_points_vis[:, 0], obstacle_points_vis[:, 1], obstacle_points_vis[:, 2], 
+               c='gray', alpha=0.2, s=1, label='Obstacles')
+    
+    # Plot non-edge supported cells
+    non_edge_mask = ~edge_mask
+    ax.scatter(supported_cells[non_edge_mask, 0], 
+               supported_cells[non_edge_mask, 1], 
+               supported_cells[non_edge_mask, 2],
+               c='blue', alpha=0.5, s=30, label='Safe Cells')
+    
+    # Plot different edge types with different colors
+    color_map = {'cliff': 'red', 'overhang': 'orange', 'ramp': 'yellow', 'potential_edge': 'purple'}
+    
+    for edge_type in set(edge_types.values()):
+        # Get indices for this edge type
+        indices = [i for i, t in edge_types.items() if t == edge_type]
+        if indices:
+            ax.scatter(supported_cells[indices, 0], 
+                       supported_cells[indices, 1], 
+                       supported_cells[indices, 2],
+                       c=color_map.get(edge_type, 'gray'), 
+                       s=50, 
+                       label=f'{edge_type.title()} Edges')
+    
+    # Set labels and title
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title('Edge Detection for Overhangs, Cliffs, and Ramps')
+    ax.legend()
+    
+    # Adjust aspect ratio
+    min_vals = np.min(obstacle_points_vis, axis=0)
+    max_vals = np.max(obstacle_points_vis, axis=0)
+    max_range = np.array([max_vals[0]-min_vals[0], max_vals[1]-min_vals[1], max_vals[2]-min_vals[2]]).max() / 2.0
+    mid_x = (max_vals[0]+min_vals[0]) * 0.5
+    mid_y = (max_vals[1]+min_vals[1]) * 0.5
+    mid_z = (max_vals[2]+min_vals[2]) * 0.5
+    ax.set_xlim(mid_x - max_range, mid_x + max_range)
+    ax.set_ylim(mid_y - max_range, mid_y + max_range)
+    ax.set_zlim(mid_z - max_range, mid_z + max_range)
+    
+    plt.tight_layout()
+    plt.show()
+    
+edge_mask, edge_types = detect_edge_cells(
+    supported_cells, 
+    G, 
+    obstacle_points, 
+    gpu_index_obstacles,
+    min_clearance=0.5,  
+    edge_neighbor_threshold=6,
+    horizontal_distance_threshold=0.25,
+    vertical_dropoff_threshold=0.4,
+    overhang_detection_distance=1.0
+)
+
 # Visualize the supported cells
 def visualize_supported_cells_3d():
     fig = plt.figure(figsize=(12, 10))
@@ -575,6 +844,9 @@ def visualize_empty_space_points():
 # Call the new function to visualize empty space
 visualize_empty_space_points()
 
+# Visualize the edge cells using matplotlib
+visualize_edge_cells(supported_cells, edge_mask, edge_types, obstacle_points_vis)
+
 # Timing: KDTree creation for empty space points
 start_time = time.time()
 # tree = KDTree(empty_space_points)
@@ -641,6 +913,46 @@ for batch_start in range(0, num_points, batch_size):
             if collision_free:
                 G.add_edge(i, n, weight=np.linalg.norm(empty_space_points[i] - empty_space_points[n]))
 
+def update_graph_with_edge_safety(G, edge_mask, safety_margin=2.0):
+    """
+    Update the graph by penalizing edges that are close to detected edge cells.
+    
+    Args:
+        G: Original NetworkX graph
+        edge_mask: Boolean mask indicating which cells are edges
+        safety_margin: Factor to multiply edge weights by near edges (default: 2.0)
+    
+    Returns:
+        Updated graph with safety-aware weights
+    """
+    # Create a copy of the graph to modify
+    G_safe = G.copy()
+    
+    # Get indices of edge cells
+    edge_indices = np.where(edge_mask)[0]
+    
+    # Update weights for edges connected to edge cells
+    for edge_idx in edge_indices:
+        # Get neighbors of this edge cell
+        for neighbor in G.neighbors(edge_idx):
+            if (edge_idx, neighbor) in G_safe.edges:
+                # Increase the weight to discourage using this edge
+                current_weight = G_safe[edge_idx][neighbor]['weight']
+                G_safe[edge_idx][neighbor]['weight'] = current_weight * safety_margin
+            
+            # Also mark edges to neighbors of edge cells with a penalty
+            for neighbor_of_neighbor in G.neighbors(neighbor):
+                if neighbor_of_neighbor != edge_idx and (neighbor, neighbor_of_neighbor) in G_safe.edges:
+                    # Apply a smaller penalty to second-degree connections
+                    current_weight = G_safe[neighbor][neighbor_of_neighbor]['weight']
+                    G_safe[neighbor][neighbor_of_neighbor]['weight'] = current_weight * (safety_margin * 0.5)
+    
+    return G_safe
+
+
+# Create a safety-aware graph for path planning
+G_safe = update_graph_with_edge_safety(G, edge_mask, safety_margin=3.0)
+
 graph_creation_time = time.time() - start_time
 
 # Initialize start and goal
@@ -656,22 +968,23 @@ path_calculation_time = 0
 path = []
 waypoints = []
 
+# Use the safer graph for path planning
 def find_path():
     global path, waypoints, path_calculation_time
     path_start_time = time.time()
     try:
-        # Path finding with A*
-        path = nx.astar_path(G, start_idx, goal_idx, weight='weight')
+        # Path finding with A* using the safety-aware graph
+        path = nx.astar_path(G_safe, start_idx, goal_idx, weight='weight')
         waypoints = empty_space_points[path]
         path_calculation_time = time.time() - path_start_time
-        print(f"Found path with {len(waypoints)} waypoints in {path_calculation_time:.4f} seconds")
+        print(f"Found safe path with {len(waypoints)} waypoints in {path_calculation_time:.4f} seconds")
         return True
     except nx.NetworkXNoPath:
         path_calculation_time = time.time() - path_start_time
-        print(f"No path found between start and goal (took {path_calculation_time:.4f} seconds)")
+        print(f"No safe path found between start and goal (took {path_calculation_time:.4f} seconds)")
         return False
 
-# Initialize path finding
+# Use this instead of the original find_path()
 path_found = find_path()
 
 # Open3D visualization instead of matplotlib
