@@ -771,10 +771,10 @@ edge_mask, edge_types = detect_edge_cells(
     obstacle_points, 
     gpu_index_obstacles,
     min_clearance=0.5,  
-    edge_neighbor_threshold=6,
-    horizontal_distance_threshold=0.25,
-    vertical_dropoff_threshold=0.4,
-    overhang_detection_distance=1.0
+    edge_neighbor_threshold=7,
+    horizontal_distance_threshold=0.3,
+    vertical_dropoff_threshold=0.1,
+    overhang_detection_distance=0.1
 )
 
 # Visualize the supported cells
