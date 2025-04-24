@@ -517,7 +517,9 @@ def detect_edge_cells(
     edge_neighbor_threshold=4,
     horizontal_distance_threshold=0.25,
     vertical_dropoff_threshold=0.4,
-    overhang_detection_distance=0.3
+    overhang_detection_distance=0.3,
+    isolation_threshold=2,  # New parameter: minimum cluster size to keep
+    isolation_radius=0.3    # New parameter: radius to consider for clustering
 ):
     """
     Detects cells that are at the edges of overhangs, cliffs, or ramps.
@@ -532,6 +534,8 @@ def detect_edge_cells(
         horizontal_distance_threshold: Maximum horizontal distance to consider for edge detection (default: 0.25)
         vertical_dropoff_threshold: Minimum height difference to consider a dropoff edge (default: 0.4)
         overhang_detection_distance: Distance to check for overhang detection (default: 0.3)
+        isolation_threshold: Minimum cluster size to keep (default: 2)
+        isolation_radius: Radius to consider for clustering (default: 0.3)
         
     Returns:
         edge_mask: Boolean mask of same length as supported_cells indicating edge cells
@@ -554,6 +558,52 @@ def detect_edge_cells(
             edge_types[i] = "potential_edge"  # Will refine this later
     
     print(f"Found {len(connectivity_edges)} potential edge cells based on connectivity")
+    
+    # NEW: Filter out isolated potential edges using spatial clustering
+    if len(connectivity_edges) > 0:
+        print("Filtering isolated potential edge cells...")
+        
+        # Create a FAISS index for the edge cells only
+        edge_cells = supported_cells[connectivity_edges].astype(np.float32)
+        res_edge = faiss.StandardGpuResources()
+        edge_index = faiss.IndexFlatL2(3)
+        gpu_edge_index = faiss.index_cpu_to_gpu(res_edge, 0, edge_index)
+        gpu_edge_index.add(edge_cells)
+        
+        # For each potential edge cell, check if it has enough other edge cells nearby
+        kept_edges = []
+        removed_edges = []
+        
+        # Batch process for efficiency
+        batch_size = 500
+        for start_idx in range(0, len(connectivity_edges), batch_size):
+            end_idx = min(start_idx + batch_size, len(connectivity_edges))
+            batch_indices = range(start_idx, end_idx)
+            
+            batch_query = edge_cells[batch_indices]
+            # Find neighboring edge cells within isolation_radius
+            # Using k=isolation_threshold+1 since the cell itself will be included
+            k_neighbors = min(isolation_threshold + 1, len(edge_cells))
+            D, I = gpu_edge_index.search(batch_query, k_neighbors)
+            
+            for j, local_idx in enumerate(batch_indices):
+                global_idx = connectivity_edges[local_idx]
+                # Check if there are enough neighboring edge cells within isolation_radius
+                # The cell itself is included in the count, so we subtract 1
+                nearby_edges = sum(1 for d in D[j] if d <= isolation_radius**2) - 1
+                
+                if nearby_edges >= isolation_threshold - 1:  # -1 because we exclude self
+                    kept_edges.append(global_idx)
+                else:
+                    removed_edges.append(global_idx)
+                    # Remove this cell from edge_mask and edge_types
+                    edge_mask[global_idx] = False
+                    if global_idx in edge_types:
+                        del edge_types[global_idx]
+        
+        print(f"Removed {len(removed_edges)} isolated potential edge cells, kept {len(kept_edges)}")
+        # Update connectivity_edges to only include kept edges
+        connectivity_edges = kept_edges
     
     # 2. Dropoff detection - check for sudden height changes
     # For each potential edge cell, examine the surrounding region
@@ -705,12 +755,13 @@ def detect_edge_cells(
     
     print(f"Found {len(ramp_edges)} ramp edges")
     
-    # Combine all edge types
-    all_edges = list(set(dropoff_edges + overhang_edges + ramp_edges))
+    # Combine all edge types for the final mask
+    all_edges = list(set(dropoff_edges + overhang_edges + ramp_edges + connectivity_edges))
+    all_edges = [i for i in all_edges if i in edge_types]  # Ensure valid indices
     edge_mask = np.zeros(len(supported_cells), dtype=bool)
     edge_mask[all_edges] = True
     
-    print(f"Found {len(all_edges)} total edge cells")
+    print(f"Found {len(all_edges)} total classified edge cells")
     return edge_mask, edge_types
 
 def visualize_edge_cells(supported_cells, edge_mask, edge_types, obstacle_points_vis):
@@ -771,10 +822,12 @@ edge_mask, edge_types = detect_edge_cells(
     obstacle_points, 
     gpu_index_obstacles,
     min_clearance=0.5,  
-    edge_neighbor_threshold=7,
+    edge_neighbor_threshold=6,
     horizontal_distance_threshold=0.3,
     vertical_dropoff_threshold=0.1,
-    overhang_detection_distance=0.1
+    overhang_detection_distance=0.1,
+    isolation_threshold=2,  # Minimum cluster size to keep (adjust as needed)
+    isolation_radius=0.3    # Radius to consider for clustering
 )
 
 # Visualize the supported cells
@@ -913,14 +966,30 @@ for batch_start in range(0, num_points, batch_size):
             if collision_free:
                 G.add_edge(i, n, weight=np.linalg.norm(empty_space_points[i] - empty_space_points[n]))
 
-def update_graph_with_edge_safety(G, edge_mask, safety_margin=2.0):
+def update_graph_with_edge_safety(
+    G, 
+    supported_cells,
+    edge_mask, 
+    edge_types, 
+    robot_size=(0.5, 0.5, 0.5),  # Robot bounding box (x, y, z)
+    safety_offsets={             # Additional safety margin beyond robot size
+        "cliff": 0.5,
+        "overhang": 0.4,
+        "ramp": 0.2,
+        "potential_edge": 0.3
+    }
+):
     """
-    Update the graph by penalizing edges that are close to detected edge cells.
+    Update the graph by penalizing edges that are close to detected edge cells,
+    considering different types of edges, robot size, and safety offsets.
     
     Args:
         G: Original NetworkX graph
+        supported_cells: Array of supported cell points (Nx3)
         edge_mask: Boolean mask indicating which cells are edges
-        safety_margin: Factor to multiply edge weights by near edges (default: 2.0)
+        edge_types: Dictionary mapping cell indices to edge type
+        robot_size: Robot bounding box dimensions (x, y, z)
+        safety_offsets: Dictionary of additional safety margins by edge type
     
     Returns:
         Updated graph with safety-aware weights
@@ -931,28 +1000,80 @@ def update_graph_with_edge_safety(G, edge_mask, safety_margin=2.0):
     # Get indices of edge cells
     edge_indices = np.where(edge_mask)[0]
     
-    # Update weights for edges connected to edge cells
-    for edge_idx in edge_indices:
-        # Get neighbors of this edge cell
-        for neighbor in G.neighbors(edge_idx):
-            if (edge_idx, neighbor) in G_safe.edges:
-                # Increase the weight to discourage using this edge
-                current_weight = G_safe[edge_idx][neighbor]['weight']
-                G_safe[edge_idx][neighbor]['weight'] = current_weight * safety_margin
+    # Calculate robot's maximum radius (bounding sphere)
+    robot_radius = np.sqrt(robot_size[0]**2 + robot_size[1]**2 + robot_size[2]**2) / 2
+    
+    # Create a dictionary to store total safety distances by edge type
+    total_safety_distances = {}
+    for edge_type, offset in safety_offsets.items():
+        total_safety_distances[edge_type] = robot_radius + offset
+    
+    # Create a KDTree of edge cells for efficient nearest neighbor queries
+    edge_cells = supported_cells[edge_indices]
+    edge_tree = KDTree(edge_cells)
+    
+    # For each node in the graph, check proximity to edges
+    for node in G.nodes():
+        point = supported_cells[node]
+        
+        # Find distances to all edge cells within maximum safety radius
+        max_safety_distance = max(total_safety_distances.values())
+        edge_dists, edge_idxs = edge_tree.query(point, k=10, distance_upper_bound=max_safety_distance*1.5)
+        
+        for dist, idx in zip(edge_dists, edge_idxs):
+            # Skip invalid results
+            if idx >= len(edge_indices):
+                continue
+                
+            # Get the actual index of the edge cell
+            edge_idx = edge_indices[idx]
             
-            # Also mark edges to neighbors of edge cells with a penalty
-            for neighbor_of_neighbor in G.neighbors(neighbor):
-                if neighbor_of_neighbor != edge_idx and (neighbor, neighbor_of_neighbor) in G_safe.edges:
-                    # Apply a smaller penalty to second-degree connections
-                    current_weight = G_safe[neighbor][neighbor_of_neighbor]['weight']
-                    G_safe[neighbor][neighbor_of_neighbor]['weight'] = current_weight * (safety_margin * 0.5)
+            # Get edge type and required safety distance
+            edge_type = edge_types.get(edge_idx, "potential_edge")
+            safety_distance = total_safety_distances.get(edge_type, robot_radius + 0.3)
+            
+            # If the node is within safety distance of the edge
+            if dist < safety_distance:
+                # Modify all edges connected to this node
+                for neighbor in G.neighbors(node):
+                    if (node, neighbor) in G_safe.edges:
+                        # Calculate safety factor based on proximity (closer = higher penalty)
+                        # Apply exponential penalty that increases as you get closer to the edge
+                        proximity_factor = np.exp(safety_distance - dist)
+                        
+                        # Scale by edge type importance
+                        type_factors = {
+                            "cliff": 2.5,
+                            "overhang": 2.0,
+                            "ramp": 1.3,
+                            "potential_edge": 2.5
+                        }
+                        type_factor = type_factors.get(edge_type, 1.5)
+                        
+                        # Update edge weight
+                        current_weight = G_safe[node][neighbor]['weight']
+                        G_safe[node][neighbor]['weight'] = current_weight * proximity_factor * type_factor
     
     return G_safe
 
 
 # Create a safety-aware graph for path planning
-G_safe = update_graph_with_edge_safety(G, edge_mask, safety_margin=3.0)
+robot_size = (0.25, 0.25, 0.5)  # Example robot dimensions
+safety_offsets = {
+    "cliff": 0.1,       # Maximum offset for dangerous cliffs
+    "overhang": 0.1,    # High offset for overhangs 
+    "ramp": 0.1,        # Lower offset for navigable ramps
+    "potential_edge": 0.1  # Moderate offset for unclassified edges
+}
 
+G_safe = update_graph_with_edge_safety(
+    G, 
+    supported_cells,
+    edge_mask, 
+    edge_types,
+    robot_size=robot_size,
+    safety_offsets=safety_offsets
+)
 graph_creation_time = time.time() - start_time
 
 # Initialize start and goal
@@ -968,10 +1089,83 @@ path_calculation_time = 0
 path = []
 waypoints = []
 
+def find_safe_point(point, empty_space_points, edge_mask, edge_types, supported_cells, gpu_index_empty, safety_radius=0.25):
+    """
+    Find a safe point near the given point that respects edge safety constraints.
+    
+    Args:
+        point: Original point (x, y, z)
+        empty_space_points: Array of navigable points
+        edge_mask: Boolean mask indicating which cells are edges
+        edge_types: Dictionary mapping cell indices to edge type
+        supported_cells: Array of supported cell points
+        gpu_index_empty: FAISS GPU index for navigable points
+        safety_radius: Minimum required distance from edges
+        
+    Returns:
+        index: Index of the safe point in empty_space_points
+        is_safe: Boolean indicating if a safe point was found
+    """
+    # Find nearest navigable point (standard approach)
+    D, I = gpu_index_empty.search(point.reshape(1, -1).astype(np.float32), 30)
+    
+    # Try each candidate in order of increasing distance
+    for i in range(min(30, len(I[0]))):
+        candidate_idx = I[0][i]
+        
+        # Skip if this is an edge cell
+        if edge_mask[candidate_idx]:
+            continue
+            
+        # Check distance to all edge cells
+        edge_indices = np.where(edge_mask)[0]
+        
+        if len(edge_indices) == 0:
+            # No edges to worry about
+            return candidate_idx, True
+            
+        # Create array of all edge cells
+        edge_cells = supported_cells[edge_indices]
+        
+        # Calculate distances to all edge cells
+        candidate_point = empty_space_points[candidate_idx]
+        distances = np.sqrt(np.sum((edge_cells - candidate_point)**2, axis=1))
+        
+        # Check if point is far enough from all edges
+        if np.all(distances >= safety_radius):
+            return candidate_idx, True
+    
+    # If we get here, we couldn't find a safe point
+    # Return the nearest point but flag it as unsafe
+    return I[0][0], False
+
 # Use the safer graph for path planning
 def find_path():
     global path, waypoints, path_calculation_time
     path_start_time = time.time()
+    
+    # Find safe start and goal points
+    safe_start_idx, start_is_safe = find_safe_point(
+        start_point, empty_space_points, edge_mask, edge_types, 
+        supported_cells, gpu_index_empty, safety_radius=0.3
+    )
+    
+    safe_goal_idx, goal_is_safe = find_safe_point(
+        goal_point, empty_space_points, edge_mask, edge_types, 
+        supported_cells, gpu_index_empty, safety_radius=0.3
+    )
+    
+    # Update the global start/goal indices with the safe versions
+    global start_idx, goal_idx
+    start_idx = safe_start_idx
+    goal_idx = safe_goal_idx
+    
+    if not start_is_safe:
+        print("Warning: Start point is near an edge and may be unsafe.")
+    
+    if not goal_is_safe:
+        print("Warning: Goal point is near an edge and may be unsafe.")
+    
     try:
         # Path finding with A* using the safety-aware graph
         path = nx.astar_path(G_safe, start_idx, goal_idx, weight='weight')
@@ -1070,6 +1264,25 @@ class Open3DVisualizer:
             self.update_path_visualization()
         self.vis.add_geometry(self.objects["path"])
         
+        # Add robot size information as class property for reuse
+        self.robot_size = (0.25, 0.25, 0.5)  # width, length, height
+
+        # Add robot bounding box at start position
+        self.objects["start_robot_box"] = self.create_robot_bounding_box(
+            start_point, 
+            robot_size=self.robot_size,
+            color=[0.0, 0.8, 0.0]  # Green, matching start point
+        )
+        self.vis.add_geometry(self.objects["start_robot_box"])
+
+        # Add robot bounding box at goal position
+        self.objects["goal_robot_box"] = self.create_robot_bounding_box(
+            goal_point, 
+            robot_size=self.robot_size,
+            color=[0.0, 0.0, 0.8]  # Blue, matching goal point
+        )
+        self.vis.add_geometry(self.objects["goal_robot_box"])
+    
         # Bounding box for context
         bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound=min_vals, max_bound=max_vals)
         self.objects["bbox"] = o3d.geometry.LineSet.create_from_axis_aligned_bounding_box(bbox)
@@ -1140,8 +1353,31 @@ class Open3DVisualizer:
         self.status_label = ttk.Label(status_frame, textvariable=self.status_var)
         self.status_label.pack(fill="x", padx=5, pady=5)
         
+        self.toggle_boxes_button = ttk.Button(button_frame, text="Toggle Robot Boxes", 
+                                          command=self.toggle_robot_boxes)
+        self.toggle_boxes_button.pack(side=tk.LEFT, padx=5)
+    
         # Show initial status
         self.update_status()
+    
+    def toggle_robot_boxes(self):
+        """Toggle visibility of robot bounding boxes"""
+        if not hasattr(self, '_boxes_visible'):
+            self._boxes_visible = True
+
+        if self._boxes_visible:
+            # Hide boxes
+            self.vis.remove_geometry(self.objects["start_robot_box"])
+            self.vis.remove_geometry(self.objects["goal_robot_box"])
+            self._boxes_visible = False
+        else:
+            # Show boxes
+            self.vis.add_geometry(self.objects["start_robot_box"])
+            self.vis.add_geometry(self.objects["goal_robot_box"])
+            self._boxes_visible = True
+
+        self.vis.poll_events()
+        self.vis.update_renderer()
     
     def create_slider(self, parent, label_text, min_val, max_val, initial_val):
         frame = ttk.Frame(parent)
@@ -1183,24 +1419,40 @@ class Open3DVisualizer:
             self.goal_z.get()
         ])
         
+        # Update robot bounding boxes
+        # First remove old boxes
+        self.vis.remove_geometry(self.objects["start_robot_box"])
+        self.vis.remove_geometry(self.objects["goal_robot_box"])
+    
+        # Create and add new boxes
+        self.objects["start_robot_box"] = self.create_robot_bounding_box(
+            start_point, 
+            robot_size=self.robot_size,
+            color=[0.0, 0.8, 0.0]
+        )
+        self.vis.add_geometry(self.objects["start_robot_box"])
+    
+        self.objects["goal_robot_box"] = self.create_robot_bounding_box(
+            goal_point, 
+            robot_size=self.robot_size,
+            color=[0.0, 0.0, 0.8]
+        )
+        self.vis.add_geometry(self.objects["goal_robot_box"])
+        
         # Update sphere positions
         self.objects["start"].translate(start_point - np.asarray(self.objects["start"].get_center()))
         self.objects["goal"].translate(goal_point - np.asarray(self.objects["goal"].get_center()))
         
-        # Find nearest navigable points
-        start_idx = gpu_index_empty.search(start_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
-        goal_idx = gpu_index_empty.search(goal_point.reshape(1, -1).astype(np.float32), 1)[1][0][0]
+        # Recompute path (this will find safe start/goal points)
+        path_found = find_path()
         
-        # Update nearest points
+        # Update nearest point markers with the safety-adjusted points
         self.objects["start_nearest"].translate(
             empty_space_points[start_idx] - np.asarray(self.objects["start_nearest"].get_center())
         )
         self.objects["goal_nearest"].translate(
             empty_space_points[goal_idx] - np.asarray(self.objects["goal_nearest"].get_center())
         )
-        
-        # Recompute path
-        path_found = find_path()
         
         # Update path visualization
         self.update_path_visualization()
@@ -1245,7 +1497,52 @@ class Open3DVisualizer:
                 
             self.vis.poll_events()
             self.vis.update_renderer()
-    
+    def create_robot_bounding_box(self, position, robot_size=(0.25, 0.25, 0.5), color=[0.9, 0.6, 0.1]):
+        """
+        Creates a wireframe box to represent the robot's dimensions at a given position.
+
+        Args:
+            position: Center position of the robot [x, y, z]
+            robot_size: Dimensions of the robot as (width, length, height)
+            color: RGB color for the bounding box
+
+        Returns:
+            Open3D LineSet object representing the robot bounding box
+        """
+        # Calculate the robot's bounding box corners
+        width, length, height = robot_size
+        half_width, half_length, half_height = width/2, length/2, height/2
+
+        # Define the 8 corners of the bounding box relative to center
+        points = [
+            [half_width, half_length, half_height],    # top front right
+            [half_width, half_length, -half_height],   # bottom front right
+            [half_width, -half_length, half_height],   # top back right
+            [half_width, -half_length, -half_height],  # bottom back right
+            [-half_width, half_length, half_height],   # top front left
+            [-half_width, half_length, -half_height],  # bottom front left
+            [-half_width, -half_length, half_height],  # top back left
+            [-half_width, -half_length, -half_height], # bottom back left
+        ]
+
+        # Translate points to the center position
+        points = np.array(points) + np.array(position)
+
+        # Define the 12 lines connecting the corners
+        lines = [
+            [0, 1], [0, 2], [1, 3], [2, 3],  # right face
+            [4, 5], [4, 6], [5, 7], [6, 7],  # left face
+            [0, 4], [1, 5], [2, 6], [3, 7]   # connecting lines
+        ]
+
+        # Create LineSet
+        line_set = o3d.geometry.LineSet()
+        line_set.points = o3d.utility.Vector3dVector(points)
+        line_set.lines = o3d.utility.Vector2iVector(lines)
+        line_set.colors = o3d.utility.Vector3dVector([color for _ in range(len(lines))])
+
+        return line_set
+
     def show_graph_view(self):
         """Show navigation graph in a new window"""
         # Create a new visualizer for graph view with a unique name
