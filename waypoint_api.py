@@ -1089,9 +1089,11 @@ path_calculation_time = 0
 path = []
 waypoints = []
 
-def find_safe_point(point, empty_space_points, edge_mask, edge_types, supported_cells, gpu_index_empty, safety_radius=0.25):
+def find_safe_point(point, empty_space_points, edge_mask, edge_types, supported_cells, 
+                    gpu_index_empty, safety_radius=0.25, max_candidates=200):
     """
     Find a safe point near the given point that respects edge safety constraints.
+    If no perfectly safe point is found, return the safest available point.
     
     Args:
         point: Original point (x, y, z)
@@ -1101,42 +1103,74 @@ def find_safe_point(point, empty_space_points, edge_mask, edge_types, supported_
         supported_cells: Array of supported cell points
         gpu_index_empty: FAISS GPU index for navigable points
         safety_radius: Minimum required distance from edges
+        max_candidates: Maximum number of candidate points to examine
         
     Returns:
-        index: Index of the safe point in empty_space_points
-        is_safe: Boolean indicating if a safe point was found
+        index: Index of the safe(st) point in empty_space_points
+        is_safe: Boolean indicating if a truly safe point was found
     """
-    # Find nearest navigable point (standard approach)
-    D, I = gpu_index_empty.search(point.reshape(1, -1).astype(np.float32), 30)
+    # First try: find nearest navigable point
+    D, I = gpu_index_empty.search(point.reshape(1, -1).astype(np.float32), max_candidates)
     
-    # Try each candidate in order of increasing distance
-    for i in range(min(30, len(I[0]))):
+    # Get indices of all edge cells
+    edge_indices = np.where(edge_mask)[0]
+    
+    if len(edge_indices) == 0:
+        # No edges to worry about, just return the nearest point
+        return I[0][0], True
+    
+    # Create array of all edge cells
+    edge_cells = supported_cells[edge_indices]
+    
+    # Try each candidate in order of increasing distance from the target
+    best_candidate_idx = -1
+    best_candidate_safety = -float('inf')  # Lower is worse
+    best_min_distance = 0
+    
+    for i in range(min(max_candidates, len(I[0]))):
         candidate_idx = I[0][i]
         
         # Skip if this is an edge cell
         if edge_mask[candidate_idx]:
             continue
-            
-        # Check distance to all edge cells
-        edge_indices = np.where(edge_mask)[0]
-        
-        if len(edge_indices) == 0:
-            # No edges to worry about
-            return candidate_idx, True
-            
-        # Create array of all edge cells
-        edge_cells = supported_cells[edge_indices]
         
         # Calculate distances to all edge cells
         candidate_point = empty_space_points[candidate_idx]
         distances = np.sqrt(np.sum((edge_cells - candidate_point)**2, axis=1))
         
-        # Check if point is far enough from all edges
-        if np.all(distances >= safety_radius):
+        # Find the minimum distance to any edge
+        min_distance = np.min(distances) if len(distances) > 0 else safety_radius
+        
+        # Calculate a safety score (balances closeness to target vs. distance from edges)
+        # We prefer points that are far from edges but still close to the target
+        distance_to_target = np.sqrt(D[0][i])
+        safety_score = min_distance - (distance_to_target * 0.2)  # Weight distance less than safety
+        
+        # Check if point is far enough from all edges (truly safe)
+        if min_distance >= safety_radius:
             return candidate_idx, True
+        
+        # Otherwise, keep track of the safest point so far
+        if safety_score > best_candidate_safety:
+            best_candidate_safety = safety_score
+            best_candidate_idx = candidate_idx
+            best_min_distance = min_distance
     
-    # If we get here, we couldn't find a safe point
-    # Return the nearest point but flag it as unsafe
+    # If we got here, no perfect match was found
+    # Return the safest available point with a warning
+    if best_candidate_idx >= 0:
+        print(f"Warning: Returning a point with {best_min_distance:.2f}m clearance from edges (target: {safety_radius:.2f}m)")
+        return best_candidate_idx, False
+    
+    # Absolute fallback: return the nearest non-edge point
+    for i in range(min(max_candidates, len(I[0]))):
+        candidate_idx = I[0][i]
+        if not edge_mask[candidate_idx]:
+            print(f"Warning: Falling back to nearest non-edge point (no safe point found)")
+            return candidate_idx, False
+    
+    # Ultimate fallback: return the nearest point of any kind
+    print(f"Warning: No non-edge point found, returning the absolute nearest point")
     return I[0][0], False
 
 # Use the safer graph for path planning
@@ -1147,12 +1181,14 @@ def find_path():
     # Find safe start and goal points
     safe_start_idx, start_is_safe = find_safe_point(
         start_point, empty_space_points, edge_mask, edge_types, 
-        supported_cells, gpu_index_empty, safety_radius=0.3
+        supported_cells, gpu_index_empty, safety_radius=0.3,
+        max_candidates=200  # Increased search range
     )
     
     safe_goal_idx, goal_is_safe = find_safe_point(
         goal_point, empty_space_points, edge_mask, edge_types, 
-        supported_cells, gpu_index_empty, safety_radius=0.3
+        supported_cells, gpu_index_empty, safety_radius=0.3,
+        max_candidates=200  # Increased search range
     )
     
     # Update the global start/goal indices with the safe versions
@@ -1160,11 +1196,14 @@ def find_path():
     start_idx = safe_start_idx
     goal_idx = safe_goal_idx
     
+    # Improved warning messages
     if not start_is_safe:
-        print("Warning: Start point is near an edge and may be unsafe.")
+        print(f"Warning: Start point ({start_point}) is outside safe region.")
+        print(f"Using safer alternative at {empty_space_points[start_idx]}")
     
     if not goal_is_safe:
-        print("Warning: Goal point is near an edge and may be unsafe.")
+        print(f"Warning: Goal point ({goal_point}) is outside safe region.")
+        print(f"Using safer alternative at {empty_space_points[goal_idx]}")
     
     try:
         # Path finding with A* using the safety-aware graph
@@ -1175,7 +1214,7 @@ def find_path():
         return True
     except nx.NetworkXNoPath:
         path_calculation_time = time.time() - path_start_time
-        print(f"No safe path found between start and goal (took {path_calculation_time:.4f} seconds)")
+        print(f"No safe path found between the chosen points (took {path_calculation_time:.4f} seconds)")
         return False
 
 # Use this instead of the original find_path()
@@ -1405,25 +1444,25 @@ class Open3DVisualizer:
     
     def update_positions(self):
         global start_point, goal_point, start_idx, goal_idx, path_found
-        
+
         # Get current values from sliders
         start_point = np.array([
             self.start_x.get(),
             self.start_y.get(),
             self.start_z.get()
         ])
-        
+
         goal_point = np.array([
             self.goal_x.get(),
             self.goal_y.get(),
             self.goal_z.get()
         ])
-        
+
         # Update robot bounding boxes
         # First remove old boxes
         self.vis.remove_geometry(self.objects["start_robot_box"])
         self.vis.remove_geometry(self.objects["goal_robot_box"])
-    
+
         # Create and add new boxes
         self.objects["start_robot_box"] = self.create_robot_bounding_box(
             start_point, 
@@ -1431,21 +1470,21 @@ class Open3DVisualizer:
             color=[0.0, 0.8, 0.0]
         )
         self.vis.add_geometry(self.objects["start_robot_box"])
-    
+
         self.objects["goal_robot_box"] = self.create_robot_bounding_box(
             goal_point, 
             robot_size=self.robot_size,
             color=[0.0, 0.0, 0.8]
         )
         self.vis.add_geometry(self.objects["goal_robot_box"])
-        
+
         # Update sphere positions
         self.objects["start"].translate(start_point - np.asarray(self.objects["start"].get_center()))
         self.objects["goal"].translate(goal_point - np.asarray(self.objects["goal"].get_center()))
-        
+
         # Recompute path (this will find safe start/goal points)
         path_found = find_path()
-        
+
         # Update nearest point markers with the safety-adjusted points
         self.objects["start_nearest"].translate(
             empty_space_points[start_idx] - np.asarray(self.objects["start_nearest"].get_center())
@@ -1453,13 +1492,13 @@ class Open3DVisualizer:
         self.objects["goal_nearest"].translate(
             empty_space_points[goal_idx] - np.asarray(self.objects["goal_nearest"].get_center())
         )
-        
+
         # Update path visualization
         self.update_path_visualization()
-        
+
         # Update status
         self.update_status()
-        
+
         # Update all geometries in the visualizer
         self.update_geometries()
     
