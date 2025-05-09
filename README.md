@@ -32,7 +32,6 @@ The core script is [waypoints.py](waypoints.py), which:
 8. Finds a shortest path (A⋆) between start and goal points.  
 9. Provides interactive 3D visualizations (Open3D/PyVista/Matplotlib).
 
-![Architecture Diagram](docs/overview.png) _\<-- placeholder for your diagram_
 
 ---
 
