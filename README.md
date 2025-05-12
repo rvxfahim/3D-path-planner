@@ -145,9 +145,7 @@ Refer to [waypoints.py](waypoints.py) for full signatures and docstrings.
 ---
 
 ## Visualization
-
-![Ray Casting Animation](docs/ray_casting.png) _\<-- placeholder_  
-![Supported Cells](docs/supported_cells.png) _\<-- placeholder_  
+ 
 
 - **Matplotlib 3D**: final supported cells & obstacles.  
 - **Open3D GUI**: real‑time ray casting with sliders.  
